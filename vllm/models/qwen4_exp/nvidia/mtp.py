@@ -449,6 +449,17 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        # The target model gets these in model.py; the draft head runs the same
+        # unquantized FP16 projections and executes once per speculative token.
+        from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
+        from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+
+        enable_qwen38_sm70_fp16_gemv(
+            self, vllm_config.model_config.dtype, vllm_config
+        )
+        enable_qwen38_sm70_fp16_fused_hc(
+            self, vllm_config.model_config.dtype, vllm_config
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
