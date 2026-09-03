@@ -48,7 +48,11 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
-_COMPACT_GROUPED_MAX_TOKENS: Final = 10
+# Upstream default is 10. Overridable so the compact-grouped decode route can be
+# bounded away from sizes where it measures slower than the fallback.
+_COMPACT_GROUPED_MAX_TOKENS: Final = int(
+    os.getenv("VLLM_SM70_NVFP4_MOE_COMPACT_GROUPED_MAX_TOKENS", "10")
+)
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
 _QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
