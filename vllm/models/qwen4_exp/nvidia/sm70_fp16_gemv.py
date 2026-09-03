@@ -30,6 +30,9 @@ class _GemvPlan(NamedTuple):
     block_k: int
     num_warps: int
     load_policy: int
+    # Largest M for which the tiled route still beats cuBLAS on SM70,
+    # measured per role shape.  M above this falls back to F.linear.
+    max_m: int = 1
 
 
 _HC_DOWN_SUFFIX = ".input_mix_weight_down_block_inject"
@@ -45,15 +48,20 @@ _ROUTER_SUFFIX = ".mlp.gate"
 # role in the key: GDN and QSA can share a physical shape while remaining
 # independently auditable.
 _ROLE_PLANS: tuple[tuple[str, tuple[int, int], _GemvPlan], ...] = (
-    (_HC_DOWN_SUFFIX, (336, 10240), _GemvPlan(512, 4, 1)),
-    (_GDN_QKVZ_SUFFIX, (4096, 2560), _GemvPlan(512, 2, 0)),
-    (_GDN_BA_SUFFIX, (24, 2560), _GemvPlan(512, 4, 0)),
-    (_GDN_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 1)),
-    (_QSA_QKV_SUFFIX, (3584, 2560), _GemvPlan(512, 2, 0)),
-    (_QSA_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 0)),
-    (_QSA_INDEX_SUFFIX, (640, 2560), _GemvPlan(512, 2, 0)),
-    (_ROUTER_SUFFIX, (512, 2560), _GemvPlan(1024, 8, 0)),
+    # max_m measured on 4xV100 (micro_m2d.py), tiled-vs-cuBLAS ratio in comment
+    (_HC_DOWN_SUFFIX, (336, 10240), _GemvPlan(512, 4, 1, 2)),   # M3 0.95x
+    (_GDN_QKVZ_SUFFIX, (4096, 2560), _GemvPlan(512, 2, 0, 4)),  # M4 1.12x
+    (_GDN_BA_SUFFIX, (24, 2560), _GemvPlan(512, 4, 0, 16)),     # M16 1.63x
+    (_GDN_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 1, 8)),   # M8 1.14x
+    (_QSA_QKV_SUFFIX, (3584, 2560), _GemvPlan(512, 2, 0, 8)),   # M8 1.09x
+    (_QSA_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 0, 8)),   # M8 1.08x
+    (_QSA_INDEX_SUFFIX, (640, 2560), _GemvPlan(512, 2, 0, 16)), # M16 1.14x
+    (_ROUTER_SUFFIX, (512, 2560), _GemvPlan(1024, 8, 0, 16)),   # M16 1.36x
 )
+
+# The fused GDN input op drives (4096, 2560) and (24, 2560) together, so it
+# inherits the tighter of the two ceilings.
+_GDN_FUSED_MAX_M = 4
 
 _SHAPE_PLANS = {shape: plan for _, shape, plan in _ROLE_PLANS}
 
@@ -95,6 +103,57 @@ def _qwen38_fp16_row_gemv_kernel(
             )
         acc += x.to(tl.float32) * weight.to(tl.float32)
     tl.store(out_ptr + row, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _qwen38_fp16_row_gemv_m_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    LOAD_POLICY: tl.constexpr,
+):
+    """Multi-token sibling of the M=1 row GEMV.
+
+    Grid stays (N,): one program still owns one output row and streams the
+    whole weight row exactly once, now reusing each loaded block across the
+    BLOCK_M query rows.  That keeps HBM weight traffic identical to M=1.
+    """
+    row = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for block_start in tl.static_range(0, K, BLOCK_K):
+        indices = block_start + offs_k
+        k_mask = indices < K
+        x_mask = m_mask[:, None] & k_mask[None, :]
+        if LOAD_POLICY == 1:
+            weight = tl.load(
+                weight_ptr + row * K + indices,
+                mask=k_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + indices[None, :],
+                mask=x_mask,
+                other=0.0,
+                eviction_policy="evict_last",
+            )
+        else:
+            weight = tl.load(weight_ptr + row * K + indices, mask=k_mask, other=0.0)
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + indices[None, :],
+                mask=x_mask,
+                other=0.0,
+            )
+        acc += x.to(tl.float32) * weight.to(tl.float32)[None, :]
+    tl.store(out_ptr + offs_m * N + row, tl.sum(acc, axis=1), mask=m_mask)
 
 
 @triton.jit
@@ -142,14 +201,68 @@ def _qwen38_fp16_gdn_input_kernel(
     tl.store(a_out_ptr + ba_row - 12, value, mask=is_a)
 
 
+@triton.jit
+def _qwen38_fp16_gdn_input_m_kernel(
+    x_ptr,
+    qkvz_weight_ptr,
+    ba_weight_ptr,
+    qkv_out_ptr,
+    z_out_ptr,
+    b_out_ptr,
+    a_out_ptr,
+    M,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Multi-token sibling of the fused GDN input projection."""
+    row = tl.program_id(0)
+    is_qkvz = row < 4096
+    ba_row = row - 4096
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for block_start in tl.static_range(0, K, BLOCK_K):
+        indices = block_start + offs_k
+        k_mask = indices < K
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + indices[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        qkvz_weight = tl.load(
+            qkvz_weight_ptr + row * K + indices,
+            mask=is_qkvz & k_mask,
+            other=0.0,
+        )
+        ba_weight = tl.load(
+            ba_weight_ptr + ba_row * K + indices,
+            mask=(~is_qkvz) & k_mask,
+            other=0.0,
+        )
+        weight = tl.where(is_qkvz, qkvz_weight, ba_weight)
+        acc += x.to(tl.float32) * weight.to(tl.float32)[None, :]
+
+    value = tl.sum(acc, axis=1)
+    is_qkv = is_qkvz & (row < 2560)
+    is_z = is_qkvz & (row >= 2560)
+    is_b = (~is_qkvz) & (ba_row < 12)
+    is_a = (~is_qkvz) & (ba_row >= 12)
+    tl.store(qkv_out_ptr + offs_m * 2560 + row, value, mask=m_mask & is_qkv)
+    tl.store(z_out_ptr + offs_m * 1536 + row - 2560, value, mask=m_mask & is_z)
+    tl.store(b_out_ptr + offs_m * 12 + ba_row, value, mask=m_mask & is_b)
+    tl.store(a_out_ptr + offs_m * 12 + ba_row - 12, value, mask=m_mask & is_a)
+
+
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
     return tensor.ndim == 2 and tensor.stride() == (tensor.shape[1], 1)
 
 
-def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _runtime_ok(x: torch.Tensor, weight: torch.Tensor, max_m: int = 1) -> bool:
     return bool(
         not envs.VLLM_BATCH_INVARIANT
-        and x.shape[0] == 1
+        and 1 <= x.shape[0] <= max_m
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
         and x.dtype == torch.float16
@@ -163,20 +276,40 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 def _qwen38_sm70_fp16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     plan = _SHAPE_PLANS.get((weight.shape[0], weight.shape[1]))
-    if plan is None or not _runtime_ok(x, weight):
+    if plan is None or not _runtime_ok(x, weight, plan.max_m):
         return torch.nn.functional.linear(x, weight)
 
-    out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
-    _qwen38_fp16_row_gemv_kernel[(weight.shape[0],)](
+    rows = int(x.shape[0])
+    n = int(weight.shape[0])
+    if rows == 1:
+        # Untouched single-token route: identical kernel, identical launch.
+        out = torch.empty((1, n), dtype=x.dtype, device=x.device)
+        _qwen38_fp16_row_gemv_kernel[(n,)](
+            x,
+            weight,
+            out,
+            K=weight.shape[1],
+            BLOCK_K=plan.block_k,
+            LOAD_POLICY=plan.load_policy,
+            num_warps=plan.num_warps,
+        )
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
+        return out
+
+    out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
+    _qwen38_fp16_row_gemv_m_kernel[(n,)](
         x,
         weight,
         out,
+        rows,
+        N=n,
         K=weight.shape[1],
+        BLOCK_M=triton.next_power_of_2(rows),
         BLOCK_K=plan.block_k,
         LOAD_POLICY=plan.load_policy,
         num_warps=plan.num_warps,
     )
-    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
+    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M>1 tiled GEMV route enabled.")
     return out
 
 
@@ -199,8 +332,8 @@ def _qwen38_sm70_fp16_gdn_input(
     if not (
         qkvz_weight.shape == (4096, 2560)
         and ba_weight.shape == (24, 2560)
-        and _runtime_ok(x, qkvz_weight)
-        and _runtime_ok(x, ba_weight)
+        and _runtime_ok(x, qkvz_weight, _GDN_FUSED_MAX_M)
+        and _runtime_ok(x, ba_weight, _GDN_FUSED_MAX_M)
     ):
         qkvz = torch.nn.functional.linear(x, qkvz_weight)
         ba = torch.nn.functional.linear(x, ba_weight)
@@ -211,11 +344,30 @@ def _qwen38_sm70_fp16_gdn_input(
             ba[..., 12:].contiguous(),
         )
 
-    qkv = x.new_empty((1, 2560))
-    z = x.new_empty((1, 1536))
-    b = x.new_empty((1, 12))
-    a = x.new_empty((1, 12))
-    _qwen38_fp16_gdn_input_kernel[(4096 + 24,)](
+    rows = int(x.shape[0])
+    qkv = x.new_empty((rows, 2560))
+    z = x.new_empty((rows, 1536))
+    b = x.new_empty((rows, 12))
+    a = x.new_empty((rows, 12))
+    if rows == 1:
+        _qwen38_fp16_gdn_input_kernel[(4096 + 24,)](
+            x,
+            qkvz_weight,
+            ba_weight,
+            qkv,
+            z,
+            b,
+            a,
+            K=2560,
+            BLOCK_K=512,
+            num_warps=2,
+        )
+        logger.info_once(
+            "SM70 Qwen3.8 checkpoint-FP16 fused GDN input route enabled."
+        )
+        return qkv, z, b, a
+
+    _qwen38_fp16_gdn_input_m_kernel[(4096 + 24,)](
         x,
         qkvz_weight,
         ba_weight,
@@ -223,11 +375,15 @@ def _qwen38_sm70_fp16_gdn_input(
         z,
         b,
         a,
+        rows,
         K=2560,
+        BLOCK_M=triton.next_power_of_2(rows),
         BLOCK_K=512,
         num_warps=2,
     )
-    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 fused GDN input route enabled.")
+    logger.info_once(
+        "SM70 Qwen3.8 checkpoint-FP16 fused GDN input M>1 tiled route enabled."
+    )
     return qkv, z, b, a
 
 
@@ -287,7 +443,9 @@ def _exact_runtime_contract(vllm_config=None) -> bool:
 
     return bool(
         tp_size == 4
-        and config.speculative_config is None
+        # The M=1 restriction that this clause used to stand in for now lives
+        # in the kernels themselves (per-shape max_m), so speculative decoding
+        # is admitted and simply routes through the tiled path.
         and int(getattr(text_config, "hidden_size", 0)) == 2560
         and int(getattr(text_config, "num_hidden_layers", 0)) == 48
         and int(getattr(text_config, "num_experts", 0)) == 512
