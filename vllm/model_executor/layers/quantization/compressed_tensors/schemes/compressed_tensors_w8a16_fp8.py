@@ -184,6 +184,11 @@ _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
     (1536, 5120): (12, 2, False),
     (5120, 8704): (16, 2, False),
     (4352, 5120): (16, 2, False),
+    # hidden=2560 (Qwen3.8-Flash-Next TP4), swept on 4x V100.
+    (2560, 4096): (16, 2, False),
+    (2560, 3328): (16, 2, False),
+    (1536, 2560): (16, 2, False),
+    (2560, 320): (16, 2, False),
 }
 _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
@@ -246,6 +251,7 @@ def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
         if stale in layer._parameters:
             del layer._parameters[stale]
     layer.sm70_fp8_fp16_dequant = True
+
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
@@ -338,6 +344,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         if self.use_sm70_fp8_turbomind:
             return
 
+        # No SM70 kernel can execute this checkpoint's channel-FP8 shapes;
+        # unpack them to the model dtype instead (see patch_fp8deq.py).
+        self.sm70_fp16_dequant = bool(
+            sm70_tm.is_exact_sm70_cuda_platform() and not self.use_sm70_fp8_turbomind
+        )
         self.linear_kernel = init_wfp8_a16_linear_kernel(
             weight_quant_key=self.weight_quant_key,
             activation_quant_key=self.activation_quant_key,
@@ -523,6 +534,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     "weight_scale",
                     convert_to_channelwise(layer.weight_scale, layer.logical_widths),
                 )
+
+        if self.sm70_fp16_dequant:
+            _sm70_unpack_channel_fp8(layer)
+            return
 
         self.linear_kernel.process_weights_after_loading(layer)
 
