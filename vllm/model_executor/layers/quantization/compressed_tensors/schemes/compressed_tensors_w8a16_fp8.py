@@ -46,13 +46,17 @@ __all__ = ["CompressedTensorsW8A16Fp8"]
 
 logger = init_logger(__name__)
 
+# Per-rank (N, K) shapes with a measured QPN8 tile, keyed by role. Different
+# models reuse these role names, so each maps to every admitted shape.
 _SM70_CHANNEL_FP8_QPN8_SHAPES = {
-    "in_proj_qkvz": (4096, 5120),
-    "qkv_proj": (3584, 5120),
-    "out_proj": (5120, 1536),
-    "o_proj": (5120, 1536),
-    "gate_up_proj": (8704, 5120),
-    "down_proj": (5120, 4352),
+    "in_proj_qkvz": ((4096, 5120), (4096, 2560)),
+    "qkv_proj": ((3584, 5120), (3328, 2560)),
+    "out_proj": ((5120, 1536), (2560, 1536)),
+    "o_proj": ((5120, 1536), (2560, 1536)),
+    "gate_up_proj": ((8704, 5120), (320, 2560)),
+    # down_proj at hidden=2560 is (2560, 160); K/16 = 10 admits no supported
+    # split_k, so it stays on the FP16 unpack below.
+    "down_proj": ((5120, 4352),),
 }
 _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
     # (K, N): (split-K, accumulator chains, prefetch codes)
@@ -61,6 +65,11 @@ _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
     (1536, 5120): (12, 2, False),
     (5120, 8704): (16, 2, False),
     (4352, 5120): (16, 2, False),
+    # hidden=2560 (Qwen3.8-Flash-Next TP4), swept on 4x V100.
+    (2560, 4096): (16, 2, False),
+    (2560, 3328): (16, 2, False),
+    (1536, 2560): (16, 2, False),
+    (2560, 320): (16, 2, False),
 }
 _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
@@ -78,10 +87,36 @@ def _sm70_channel_fp8_qpn8_config(
     if getattr(layer, "tp_size", 1) != 4:
         return None
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    if tuple(layer.weight.shape) != _SM70_CHANNEL_FP8_QPN8_SHAPES.get(suffix):
+    admitted = _SM70_CHANNEL_FP8_QPN8_SHAPES.get(suffix)
+    if admitted is None or tuple(layer.weight.shape) not in admitted:
         return None
     n_dim, k_dim = (int(dim) for dim in layer.weight.shape)
     return _SM70_CHANNEL_FP8_QPN8_CONFIGS.get((k_dim, n_dim))
+
+
+def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
+    """Materialize channel-FP8 weights as ordinary model-dtype weights.
+
+    FP8 E4M3 -> FP16 is exact, so this costs one extra byte per element on the
+    affected projections and nothing in accuracy. Used wherever no SM70 FP8
+    GEMM covers the shape.
+    """
+    scale = layer.weight_scale.data.to(torch.float32)
+    if scale.ndim == 1:
+        scale = scale.view(-1, 1)
+    elif scale.ndim == 2 and scale.shape[1] != 1:
+        scale = scale.reshape(layer.weight.shape[0], -1)[:, :1]
+    dequantized = (layer.weight.data.to(torch.float32) * scale).to(layer.orig_dtype)
+    replace_parameter(layer, "weight", dequantized)
+    for stale in ("weight_scale", "weight_scale_inv", "input_scale"):
+        if stale in layer._parameters:
+            del layer._parameters[stale]
+    layer.sm70_fp8_fp16_dequant = True
+    logger.info_once(
+        "SM70 compressed-tensors channel-FP8 dense weights unpacked to %s "
+        "(no SM70 FP8 GEMM covers these shapes).",
+        layer.orig_dtype,
+    )
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
@@ -174,6 +209,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         if self.use_sm70_fp8_turbomind:
             return
 
+        # No SM70 kernel can execute this checkpoint's channel-FP8 shapes;
+        # unpack them to the model dtype instead (see patch_fp8deq.py).
+        self.sm70_fp16_dequant = bool(
+            sm70_tm.is_exact_sm70_cuda_platform() and not self.use_sm70_fp8_turbomind
+        )
         self.linear_kernel = init_wfp8_a16_linear_kernel(
             weight_quant_key=self.weight_quant_key,
             activation_quant_key=self.activation_quant_key,
@@ -271,22 +311,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         "Insufficient memory for the SM70 channel-FP8 QPN8 "
                         "prefill workspace; retaining the TurboMind layout."
                     )
-            tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
-                layer.weight, weight_scale, 128, False
-            )
-            replace_parameter(layer, "weight", tm_weight)
-            del layer._parameters["weight_scale"]
-            replace_parameter(layer, "weight_scale_inv", tm_scales)
-            layer.input_scale = None
-            layer.sm70_fp8_turbomind = True
-            layer.sm70_fp8_channel_scale = True
-            layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
-            layer.sm70_fp8_k_ld = int(meta[0].item())
-            layer.sm70_fp8_q_ld = int(meta[1].item())
-            logger.info_once(
-                "SM70 compressed-tensors channel-FP8 TurboMind W8A16 dense "
-                "path enabled."
-            )
+            # No QPN8 tile covers this shape, and the plain TurboMind
+            # channel-FP8 GEMM has none either: fp8_gemm_sm70_out spins forever
+            # on shapes outside its validated set. Unpack instead.
+            del weight_scale
+            _sm70_unpack_channel_fp8(layer)
             return
 
         if self.strategy == QuantizationStrategy.BLOCK:
@@ -309,6 +338,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     convert_to_channelwise(layer.weight_scale, layer.logical_widths),
                 )
 
+        if self.sm70_fp16_dequant:
+            _sm70_unpack_channel_fp8(layer)
+            return
+
         self.linear_kernel.process_weights_after_loading(layer)
 
     def apply_weights(
@@ -317,6 +350,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "sm70_fp8_fp16_dequant", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
         if getattr(layer, "sm70_fp8_turbomind", False):
             if x.dtype != torch.float16:
                 raise RuntimeError(
