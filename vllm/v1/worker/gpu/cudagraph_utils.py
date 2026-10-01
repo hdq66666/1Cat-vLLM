@@ -129,12 +129,28 @@ def _split_sm70_mtp_manager_capture_sizes(
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     verifier_query_len = speculative_config.num_speculative_state_tokens() + 1
-    return [
+    request_sizes = [
         size // verifier_query_len
         for size in capture_sizes
         if size % verifier_query_len == 0
         and size // verifier_query_len <= vllm_config.scheduler_config.max_num_seqs
     ]
+    if (
+        envs.VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES
+        and verifier_query_len in request_sizes
+    ):
+        # On Qwen3.8-Flash-Next, TP4, MTP4, max_num_seqs 5 (2026-10-01),
+        # turning the split graphs on made a round with four concurrent
+        # requests about 2.5 ms slower, while one request got faster and
+        # five stayed equal. Before the split every draft step ran padded to
+        # five rows, the shape the drafter's MoE is tuned for. Keep the
+        # one-row graph and let 2..4 use the five-row one again.
+        request_sizes = [
+            size
+            for size in request_sizes
+            if size == 1 or size >= verifier_query_len
+        ]
+    return request_sizes
 
 
 class CapturedAttentionState(NamedTuple):

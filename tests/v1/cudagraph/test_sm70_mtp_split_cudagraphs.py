@@ -105,6 +105,54 @@ def test_split_managers_keep_exact_full_graph_shapes(
         assert draft_desc.num_reqs == batch_size
 
 
+def test_split_draft_manager_pads_small_batches_to_the_query_len(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1")
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "1")
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.is_cuda",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_device_capability",
+        lambda device_id=0: DeviceCapability(7, 0),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.torch.accelerator.current_device_index",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.get_pp_group",
+        lambda: MagicMock(is_first_rank=True, is_last_rank=True),
+    )
+
+    verifier_sizes = [5, 10, 15, 20, 25]
+    config = _make_config(5, verifier_sizes)
+    target = CudaGraphManager(
+        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, decode_query_len=5
+    )
+    draft = CudaGraphManager(
+        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, decode_query_len=1
+    )
+
+    assert target._capture_sizes == verifier_sizes
+    assert draft._capture_sizes == [1, 5]
+
+    target._graphs_captured = True
+    draft._graphs_captured = True
+    for num_reqs, graph_reqs in [(1, 1), (2, 5), (3, 5), (4, 5), (5, 5)]:
+        target_desc = target.dispatch(num_reqs, num_reqs * 5, 5)
+        draft_desc = draft.dispatch(num_reqs, num_reqs, 1)
+        assert target_desc.cg_mode == CUDAGraphMode.FULL
+        assert target_desc.num_tokens == num_reqs * 5
+        assert draft_desc.cg_mode == CUDAGraphMode.FULL
+        assert draft_desc.num_tokens == graph_reqs
+        assert draft_desc.num_reqs == graph_reqs
+
+
 def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
