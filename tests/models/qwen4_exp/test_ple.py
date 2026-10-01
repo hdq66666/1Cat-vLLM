@@ -215,7 +215,16 @@ def test_dummy_ple_tables_do_not_retain_uninitialized_bytes(monkeypatch, host_ro
             result.view(torch.uint8).fill_(0x7F)  # E4M3 NaN, not valid dummy data.
         return result
 
+    allocate = ple_module._empty_pinned_exact
+
+    def poisoned_allocate(shape, dtype):
+        # The host table does not come from torch.empty.
+        result = allocate(shape, dtype)
+        result.view(torch.uint8).fill_(0x7F)
+        return result
+
     monkeypatch.setattr(ple_module.torch, "empty", poisoned_empty)
+    monkeypatch.setattr(ple_module, "_empty_pinned_exact", poisoned_allocate)
     layer.prepare_accelerator_weight()
     for table in (layer.ple_device_table, layer.ple_host_storage):
         assert torch.all(table.view(torch.uint8) == 0)
@@ -239,22 +248,53 @@ def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(ple_module, "_ple_host_budget_bytes", lambda: 4 * 8)
     layer = _pinned_layer(num_embeddings=8)
-    empty = torch.empty
+    allocate = ple_module._empty_pinned_exact
 
-    def failing_empty(*args, **kwargs):
-        if kwargs.get("pin_memory"):
-            raise RuntimeError("injected pinned allocation failure")
-        return empty(*args, **kwargs)
+    def failing_allocate(*args, **kwargs):
+        raise RuntimeError("injected pinned allocation failure")
 
-    monkeypatch.setattr(ple_module.torch, "empty", failing_empty)
+    monkeypatch.setattr(ple_module, "_empty_pinned_exact", failing_allocate)
     with pytest.raises(RuntimeError, match="injected pinned allocation failure"):
         layer.materialize_tables()
     assert layer.ple_device_table is None
     assert layer.ple_host_storage is None
     assert layer._device_table_ptr == 0
-    monkeypatch.setattr(ple_module.torch, "empty", empty)
+    monkeypatch.setattr(ple_module, "_empty_pinned_exact", allocate)
     layer.materialize_tables()
     assert (layer._device_rows, layer._host_rows) == (4, 4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e4m3fn])
+def test_exact_pinned_allocation_is_pinned_and_readable_from_the_device(dtype):
+    torch.cuda.init()
+    rows, dim = 1000, 8
+    table = ple_module._empty_pinned_exact((rows, dim), dtype)
+    assert table.shape == (rows, dim)
+    assert table.dtype == dtype
+    assert table.is_pinned()
+    expected = torch.arange(rows * dim * dtype.itemsize, dtype=torch.int64) % 251
+    table.view(torch.uint8).copy_(expected.to(torch.uint8).view(rows, -1))
+    view = ple_module.get_accelerator_view_from_cpu_tensor(table)
+    # A pinned tensor is viewed in place; an unpinned one would be copied
+    # into a second pinned buffer.
+    assert view.data_ptr() == table.data_ptr()
+    assert torch.equal(view.view(torch.uint8).cpu(), table.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
+def test_exact_pinned_allocation_falls_back_to_the_torch_allocator(monkeypatch):
+    torch.cuda.init()
+    monkeypatch.setattr(ple_module, "_loaded_cudart", lambda: None)
+    table = ple_module._empty_pinned_exact((4, 8), torch.float16)
+    assert table.shape == (4, 8)
+    assert table.is_pinned()
+
+
+def test_exact_pinned_allocation_of_no_rows_pins_nothing():
+    table = ple_module._empty_pinned_exact((0, 8), torch.float16)
+    assert table.shape == (0, 8)
+    assert not table.is_pinned()
 
 
 @pytest.mark.parametrize(

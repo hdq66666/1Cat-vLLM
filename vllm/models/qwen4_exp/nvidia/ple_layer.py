@@ -87,6 +87,7 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
+_CUDA_HOST_ALLOC_DEFAULT = 0
 
 logger = init_logger(__name__)
 
@@ -124,6 +125,83 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
     return mapped_path
+
+
+def _loaded_cudart() -> ctypes.CDLL | None:
+    """The CUDA runtime library PyTorch already loaded into this process."""
+    with open("/proc/self/maps") as mappings:
+        for line in mappings:
+            fields = line.rstrip().split(maxsplit=5)
+            if len(fields) == 6 and os.path.basename(fields[5]).startswith(
+                "libcudart.so"
+            ):
+                return ctypes.CDLL(fields[5])
+    return None
+
+
+def _empty_pinned_exact(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+    """Uninitialized pinned CPU tensor that pins exactly the bytes it holds.
+
+    `torch.empty(pin_memory=True)` goes through PyTorch's caching host
+    allocator, which rounds every request up to a power of two. The 23.84 GiB
+    FP16 table of Qwen3.8-Flash-Next therefore pinned 32 GiB on each
+    tensor-parallel rank: 32.6 GiB of unswappable host memory wasted across
+    four ranks, which left a 160 GiB host with 1-4 GiB available and half its
+    swap in use (2026-10-01; torch 2.10 pinned 2.01 GiB for a 1.10 GiB
+    request). This calls cudaHostAlloc itself, with the flags that allocator
+    uses, so the tensor behaves the same and only the rounding is gone.
+
+    The block is never freed: the table lives as long as the process, and the
+    caching allocator did not return its blocks to the system either. If the
+    runtime library cannot be reached or the result is not recognised as
+    pinned, this falls back to the PyTorch allocator -- an unpinned tensor
+    would make get_cuda_view_from_cpu_tensor pin a second copy.
+    """
+
+    nbytes = math.prod(shape) * dtype.itemsize
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu")
+
+    def fallback(reason: str) -> torch.Tensor:
+        logger.warning(
+            "Qwen4Exp PLE exact-size pinned allocation unavailable (%s); "
+            "using the PyTorch pinned allocator, which rounds %s up to a "
+            "power of two.",
+            reason,
+            format_gib(nbytes),
+        )
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+    cudart = _loaded_cudart()
+    if cudart is None:
+        return fallback("libcudart is not loaded")
+    cudart.cudaHostAlloc.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cudart.cudaHostAlloc.restype = ctypes.c_int
+    cudart.cudaFreeHost.argtypes = [ctypes.c_void_p]
+    cudart.cudaFreeHost.restype = ctypes.c_int
+    cudart.cudaGetLastError.argtypes = []
+    cudart.cudaGetLastError.restype = ctypes.c_int
+
+    host_ptr = ctypes.c_void_p()
+    error = cudart.cudaHostAlloc(
+        ctypes.byref(host_ptr), nbytes, _CUDA_HOST_ALLOC_DEFAULT
+    )
+    if error or not host_ptr.value:
+        # Clear the runtime's last-error slot, or the next unrelated CUDA
+        # check in this thread reports this failure as its own.
+        cudart.cudaGetLastError()
+        return fallback(f"cudaHostAlloc returned error {error}")
+    buffer = (ctypes.c_ubyte * nbytes).from_address(host_ptr.value)
+    tensor = torch.frombuffer(buffer, dtype=torch.uint8).view(dtype).view(shape)
+    if not tensor.is_pinned():
+        del tensor, buffer
+        cudart.cudaFreeHost(host_ptr)
+        return fallback("the allocation is not reported as pinned")
+    return tensor
 
 
 @triton.jit
@@ -874,11 +952,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        host_storage = torch.empty(
-            (placement.host_rows, self.embedding_dim),
-            dtype=self._meta_weight_dtype,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+        # Allocated after the device table, so the CUDA context that
+        # cudaHostAlloc needs is already current on this thread.
+        host_storage = _empty_pinned_exact(
+            (placement.host_rows, self.embedding_dim), self._meta_weight_dtype
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
