@@ -721,6 +721,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
+    VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES: bool = False
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
@@ -10925,6 +10926,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
         user_visible=True,
+    ),
+    # With split draft graphs, run two to four concurrent single-token draft
+    # steps on the five-row graph instead of graphs of their own size. The
+    # drafter's MoE has a tuned tile and a native kernel only for one row and
+    # for five (the first draft pass of one request); in between it falls back
+    # to the generic tile.
+    "VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "0"))
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
