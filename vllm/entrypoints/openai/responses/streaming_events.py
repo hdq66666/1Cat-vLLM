@@ -1212,14 +1212,16 @@ class SimpleStreamingEventProcessor:
     def strip_leading_content_whitespace(
         self, delta_message: DeltaMessage
     ) -> DeltaMessage | None:
-        """Drop whitespace at the start of a message item.
+        """Drop whitespace at the start of a message that follows reasoning.
 
         Models that think first emit the blank lines that follow </think> as
         content, so a message would otherwise start with "\\n\\n". Returns
-        None when nothing is left to stream.
+        None when nothing is left to stream. Content that does not directly
+        follow reasoning is left alone (a continuation may start with a
+        space or a newline).
         """
         if (
-            self.state.current_state == _StateType.CONTENT
+            self.state.current_state != _StateType.REASONING
             or delta_message.content is None
             or delta_message.reasoning is not None
             or delta_message.tool_calls
@@ -1242,7 +1244,8 @@ class SimpleStreamingEventProcessor:
         reasoning or content parsers can hold back a partial marker. When the
         streamed text is a prefix of the text a full parse of the output
         produced, the missing suffix is streamed as one more delta. Otherwise
-        the done events carry the full-parse text.
+        the done events of a tool call carry the full-parse arguments, and
+        streamed text is kept.
         """
         if expected_text is None or self.state.current_state == _StateType.NONE:
             return []
@@ -1250,7 +1253,10 @@ class SimpleStreamingEventProcessor:
         if expected_text == streamed:
             return []
         if not expected_text.startswith(streamed):
-            self.state.accumulated_text = expected_text
+            # Tool arguments must be complete JSON, so the full-parse
+            # arguments win. Text the client already shows is kept.
+            if self.state.current_state == _StateType.TOOL_CALL:
+                self.state.accumulated_text = expected_text
             return []
         suffix = expected_text[len(streamed) :]
         handlers = self._STATE_HANDLERS[self.state.current_state]

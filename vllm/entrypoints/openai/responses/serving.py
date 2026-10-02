@@ -18,6 +18,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -155,16 +156,24 @@ def _extract_allowed_tools_from_mcp_requests(
 def _strip_leading_message_whitespace(
     items: list[ResponseOutputItem],
 ) -> list[ResponseOutputItem]:
-    """Drop whitespace at the start of message text.
+    """Drop whitespace at the start of a message that follows reasoning.
 
     Models that think first emit the blank lines after </think> as content.
     The streaming path drops them as they arrive; this does the same for a
     full parse so both paths return the same text. A message left empty is
-    removed.
+    removed. Messages that do not follow reasoning are kept as they are (a
+    continuation may start with a space or a newline).
     """
     result: list[ResponseOutputItem] = []
     for item in items:
-        if isinstance(item, ResponseOutputMessage) and item.content:
+        follows_reasoning = bool(result) and isinstance(
+            result[-1], ResponseReasoningItem
+        )
+        if (
+            follows_reasoning
+            and isinstance(item, ResponseOutputMessage)
+            and item.content
+        ):
             first = item.content[0]
             if isinstance(first, ResponseOutputText) and first.text != (
                 stripped := first.text.lstrip()
@@ -922,7 +931,7 @@ class OpenAIServingResponses(OpenAIServing):
                 output = list(streamed_items)
             else:
                 output = self._make_response_output_items(
-                    request, final_output, tokenizer
+                    request, final_output, tokenizer, final_res.prompt_token_ids
                 )
 
             if request.enable_response_messages:
@@ -1117,6 +1126,7 @@ class OpenAIServingResponses(OpenAIServing):
         request: ResponsesRequest,
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> list[ResponseOutputItem]:
         # Compute logprobs if requested
         logprobs = None
@@ -1134,6 +1144,13 @@ class OpenAIServingResponses(OpenAIServing):
             parser = self.parser(
                 tokenizer, request.tools, chat_template_kwargs=chat_template_kwargs
             )
+            # Use the reasoning boundary the streaming parser uses: when the
+            # prompt already closed the think block (thinking off), all of
+            # the output is content, even text that contains </think>.
+            if prompt_token_ids is not None and parser.is_reasoning_end(
+                list(prompt_token_ids)
+            ):
+                parser.reasoning_parser = None
             return _strip_leading_message_whitespace(
                 parser.extract_response_outputs(
                     model_output=final_output.text,
@@ -1491,6 +1508,13 @@ class OpenAIServingResponses(OpenAIServing):
             if self.parser
             else None
         )
+        if parser is not None and (
+            request.tool_choice == "none"
+            or (not self.enable_auto_tools and request.tool_choice in ("auto", None))
+        ):
+            # A full parse finds no tool calls here (_parse_tool_calls), so
+            # the stream must not emit them either.
+            parser.tool_parser = None
 
         def _get_logprobs(output: CompletionOutput) -> list[Logprob]:
             if not request.is_include_output_logprobs():
@@ -1569,7 +1593,7 @@ class OpenAIServingResponses(OpenAIServing):
         if self.parser is None or final_res is None or not final_res.outputs:
             return None
         return self._make_response_output_items(
-            request, final_res.outputs[0], tokenizer
+            request, final_res.outputs[0], tokenizer, final_res.prompt_token_ids
         )
 
     @staticmethod
@@ -1587,13 +1611,23 @@ class OpenAIServingResponses(OpenAIServing):
             return None
         streamed = processor.output_items
         if state == _StateType.TOOL_CALL:
-            position = sum(1 for item in streamed if item.type == "function_call")
+            # Only when the calls so far, the open one included, are the same
+            # functions in the same order; otherwise the parses disagree and
+            # the open call keeps what was streamed.
+            streamed_names = [
+                item.name
+                for item in streamed
+                if isinstance(item, ResponseFunctionToolCall)
+            ]
             calls = [
                 item
                 for item in full_parse
                 if isinstance(item, ResponseFunctionToolCall)
             ]
-            if position < len(calls):
+            position = len(streamed_names)
+            if position < len(calls) and [
+                call.name for call in calls[: position + 1]
+            ] == [*streamed_names, processor.state.tool_call_name]:
                 return calls[position].arguments
             return None
         if state == _StateType.REASONING:
@@ -1630,17 +1664,32 @@ class OpenAIServingResponses(OpenAIServing):
             return []
         streamed = processor.output_items
         missing: list[ResponseOutputItem] = []
-        if not any(item.type == "message" for item in streamed):
+        # A reasoning item only in the full parse means the two parses split
+        # reasoning from content differently; its message is not missing.
+        split_agrees = any(item.type == "reasoning" for item in streamed) or not any(
+            item.type == "reasoning" for item in full_parse
+        )
+        if split_agrees and not any(item.type == "message" for item in streamed):
             missing.extend(
                 item
                 for item in full_parse
                 if isinstance(item, ResponseOutputMessage) and item.content
             )
-        streamed_calls = sum(1 for item in streamed if item.type == "function_call")
+        streamed_names = [
+            item.name for item in streamed if isinstance(item, ResponseFunctionToolCall)
+        ]
         calls = [
             item for item in full_parse if isinstance(item, ResponseFunctionToolCall)
         ]
-        missing.extend(calls[streamed_calls:])
+        if [call.name for call in calls[: len(streamed_names)]] == streamed_names:
+            missing.extend(calls[len(streamed_names) :])
+        else:
+            logger.warning(
+                "Streamed tool calls %s and the full parse %s disagree; "
+                "not adding calls at the end of the stream.",
+                streamed_names,
+                [call.name for call in calls],
+            )
         if missing:
             logger.warning(
                 "Streaming parser missed %d output item(s) (%s); sending them "
