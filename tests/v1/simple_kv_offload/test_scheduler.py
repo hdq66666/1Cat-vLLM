@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from vllm import SamplingParams
@@ -40,6 +41,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
+from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -143,11 +145,20 @@ def make_scheduler(
     num_gpu_blocks: int = 16,
     num_groups: int = 1,
     lazy: bool = False,
+    options: SimpleCPUOffloadOptions | None = None,
 ) -> SchedulerFixture:
-    """Build a SimpleCPUOffloadScheduler with small block pools."""
+    """Build a SimpleCPUOffloadScheduler with small block pools.
+
+    Lazy schedulers default to no store reserve: these pools are far smaller
+    than the default reserve (max_num_seqs * (1 + #Mamba groups) blocks).
+    """
     kv_cache_config = _make_kv_cache_config(num_gpu_blocks, num_groups)
     vllm_config = _make_vllm_config()
     cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
+    if options is None and lazy:
+        options = SimpleCPUOffloadOptions(
+            lazy_offload=True, store_reserve_free_blocks=0
+        )
 
     sched = SimpleCPUOffloadScheduler(
         vllm_config=vllm_config,
@@ -156,6 +167,7 @@ def make_scheduler(
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         lazy_offload=lazy,
+        options=options,
     )
 
     # Build a real GPU block pool and bind it
@@ -1155,7 +1167,7 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     The load path must target hashes at positions [N, N+M).
 
     Request: 6 blocks (0..5).
-    - Store all 6 to CPU.
+    - Store blocks 0..3 to CPU.
     - New request: GPU prefix cache hits blocks 0,1 (hashed).
       CPU hits blocks 2,3. Blocks 4,5 are new (need compute).
     - update_state_after_alloc receives 6 GPU blocks:
@@ -1167,18 +1179,20 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     gpu_pool = fix.gpu_block_pool
 
     num_blocks = 6
+    num_stored_blocks = 4
     req = make_request(num_blocks=num_blocks)
 
-    # Store all 6 blocks to CPU via eager store.
-    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    # Store the first 4 blocks to CPU via eager store.
+    kv_blocks = _alloc_and_register(fix, req, num_stored_blocks)
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
     block_ids = kv_blocks.get_block_ids()
     sched_out = make_scheduler_output(
-        {req.request_id: num_blocks * BLOCK_SIZE},
+        {req.request_id: num_stored_blocks * BLOCK_SIZE},
         new_reqs={req.request_id: block_ids},
     )
     meta = sched.build_connector_meta(sched_out)
     assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == num_stored_blocks
     simulate_store_completion(sched, meta.store_event)
 
     # New request with same tokens — but only partial GPU prefix hit.
@@ -1191,26 +1205,15 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
         block_hasher=req._block_hasher,
     )
 
-    # GPU prefix cache hits the first 2 blocks.
+    # GPU prefix cache hits the first 2 blocks; CPU holds blocks 2,3.
     gpu_local_computed = 2 * BLOCK_SIZE
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req2, num_computed_tokens=gpu_local_computed
     )
-    # CPU has all 6 blocks stored. make_request pads num_tokens by +1, so
-    # the manager's num_tokens - 1 cap leaves all full blocks intact:
-    # remaining hashable range = 6 - 2 = 4 blocks, all hit.
-    num_cpu_hit_blocks = 4
-    assert hit_tokens == num_cpu_hit_blocks * BLOCK_SIZE, (
-        f"Expected {num_cpu_hit_blocks * BLOCK_SIZE} CPU hit tokens, got {hit_tokens}"
-    )
-    assert is_async is True
-
-    # Simulate what the real scheduler does: only accept 2 of the 4 CPU hit
-    # blocks as external (e.g. due to budget constraints), leaving 2 new
-    # blocks for fresh compute.
     num_ext_blocks = 2
     num_new_blocks = 2
-    external_tokens = num_ext_blocks * BLOCK_SIZE
+    assert hit_tokens == num_ext_blocks * BLOCK_SIZE
+    assert is_async is True
 
     # Build block list matching real layout: | comp(2) | ext_comp(2) | new(2) |
     # comp: GPU prefix cache hit — blocks with hashes
@@ -1220,11 +1223,9 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     all_gpu_blocks = gpu_comp + gpu_ext_and_new
     kv_blocks2 = KVCacheBlocks(blocks=(all_gpu_blocks,))
 
-    # Critical call: with 2 hashed comp blocks and 2 external tokens worth
-    # of blocks, the manager must derive skipped=2 and load hashes [2,3].
-    sched.update_state_after_alloc(
-        req2, kv_blocks2, num_external_tokens=external_tokens
-    )
+    # Critical call: with a 2-block local hit and 2 external blocks, the
+    # manager must load hashes [2,3] into GPU positions [2,3].
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
     block_ids2 = kv_blocks2.get_block_ids()
     sched_out2 = make_scheduler_output(
@@ -1239,10 +1240,53 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     # Verify the load targets the ext_comp GPU blocks (positions 2,3),
     # not the comp blocks (0,1) or new blocks (4,5).
     ext_block_ids = [b.block_id for b in gpu_ext_and_new[:num_ext_blocks]]
-    for bid in meta2.load_gpu_blocks:
-        assert bid in ext_block_ids, (
-            f"Load GPU block {bid} should be an ext_comp block, not a comp or new block"
+    assert meta2.load_gpu_blocks == ext_block_ids
+    for cpu_id, bhash in zip(meta2.load_cpu_blocks, req.block_hashes[2:4]):
+        assert sched.cpu_block_pool.blocks[
+            cpu_id
+        ].block_hash == make_block_hash_with_group_id(bhash, 0)
+
+
+def test_trimmed_external_tokens_raise() -> None:
+    """The scheduler never admits fewer external tokens than reported by
+    get_num_new_matched_tokens(); a mismatch is a contract violation that
+    raises (and releases the temporary CPU pin) instead of loading a
+    partial hit."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    num_blocks = 4
+    req = make_request(num_blocks=num_blocks)
+    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: num_blocks * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
         )
+    )
+    simulate_store_completion(sched, meta.store_event)
+
+    req2 = Request(
+        request_id="req-trimmed",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, _ = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == num_blocks * BLOCK_SIZE
+    cpu_free = get_cpu_free_blocks(sched)
+
+    kv_blocks2 = KVCacheBlocks(blocks=(fix.gpu_block_pool.get_new_blocks(4),))
+    with pytest.raises(RuntimeError, match="num_external_tokens"):
+        sched.update_state_after_alloc(
+            req2, kv_blocks2, num_external_tokens=hit_tokens - BLOCK_SIZE
+        )
+    assert get_cpu_free_blocks(sched) == cpu_free + num_blocks
+    assert not sched._pending_cpu_hits
+    assert not sched._reqs_to_load
 
 
 # ---------------------------------------------------------------------------

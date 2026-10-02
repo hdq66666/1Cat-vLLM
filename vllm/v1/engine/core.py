@@ -80,6 +80,8 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.simple_kv_offload.host_mem import check_host_mem_before_pinning
+from vllm.v1.simple_kv_offload.options import parse_options
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
@@ -89,6 +91,25 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+def _check_simple_cpu_offload_host_mem(vllm_config: VllmConfig) -> None:
+    """Refuse to start if pinning the whole SimpleCPUOffload CPU tier (every
+    rank of this engine) would leave too little host MemAvailable."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config is None
+        or kv_transfer_config.kv_connector != "SimpleCPUOffloadConnector"
+        # The connector does not allocate the tier without prefix caching.
+        or not vllm_config.cache_config.enable_prefix_caching
+    ):
+        return
+    options = parse_options(kv_transfer_config.kv_connector_extra_config)
+    check_host_mem_before_pinning(
+        options.cpu_bytes_total(vllm_config.parallel_config.world_size),
+        options.min_host_mem_available_gib,
+        "EngineCore",
+    )
 
 
 class EngineCore:
@@ -126,6 +147,10 @@ class EngineCore:
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
+
+        # The workers pin the SimpleCPUOffload tier while the KV caches are
+        # initialized; check host memory for all of them before that.
+        _check_simple_cpu_offload_host_mem(vllm_config)
 
         # Setup KV Caches and update CacheConfig after profiling.
         kv_cache_config = self._initialize_kv_caches(vllm_config)

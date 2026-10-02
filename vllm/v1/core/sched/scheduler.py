@@ -55,6 +55,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.simple_kv_offload.options import test_switch
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -283,6 +284,13 @@ class Scheduler(SchedulerInterface):
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+        # Blocks that async KV loads will overwrite this step, skipped from
+        # zeroing since the zeroing could race the out-of-band write.
+        self._skip_zero_block_ids: set[int] = set()
+        # Test only: zero async KV load destinations as well.
+        self._zero_kv_load_blocks = bool(
+            test_switch("VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO")
+        )
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -1041,6 +1049,16 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    if self.needs_kv_cache_zeroing and not self._zero_kv_load_blocks:
+                        # Skip zeroing of the blocks the async load will
+                        # overwrite; the zeroing could race the write.
+                        self._skip_zero_block_ids.update(
+                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                                request.request_id,
+                                num_new_local_computed_tokens,
+                                num_computed_tokens,
+                            )
+                        )
                     continue
 
                 self.running.append(request)
@@ -1140,11 +1158,7 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None)
-            if self.needs_kv_cache_zeroing
-            else None
-        )
+        new_block_ids_to_zero = self._get_new_block_ids_to_zero()
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
@@ -1197,6 +1211,20 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+        # Drain new attention block ids every step so the manager-side list
+        # does not grow unbounded; only kv-cache zeroing consumes them.
+        new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
+        if not self.needs_kv_cache_zeroing:
+            return None
+
+        if self._skip_zero_block_ids:
+            skip = self._skip_zero_block_ids
+            new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+            skip.clear()
+
+        return new_block_ids_to_zero or None
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -2271,6 +2299,18 @@ class Scheduler(SchedulerInterface):
         )
         return len(self.requests) > num_in_queues
 
+    def has_requests(self) -> bool:
+        # Override the interface default to also keep the engine stepping
+        # while the connector has background work left after the last request
+        # finished (e.g. CPU offload stores still to be submitted or
+        # completed). Empty steps carry its metadata to the workers and bring
+        # the completions back; without this the engine would go idle first.
+        return (
+            self.has_unfinished_requests()
+            or self.has_finished_requests()
+            or (self.connector is not None and self.connector.has_pending_push_work())
+        )
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2308,6 +2348,20 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if (
+            reset_running_requests
+            and not reset_successful
+            and self.connector is not None
+            and self.connector.has_pending_push_work()
+        ):
+            # Connector stores in flight (e.g. CPU offload) still pin GPU
+            # blocks that no request owns. They complete within a few steps;
+            # report failure so the caller can retry instead of raising.
+            logger.warning(
+                "Prefix cache reset deferred: KV connector transfers still "
+                "hold GPU blocks."
+            )
+            return False
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -2476,9 +2530,18 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+                if self.needs_kv_cache_zeroing:
+                    # The failed load left the blocks beyond the valid
+                    # prefix unwritten and their zeroing was skipped; zero
+                    # them before they are recomputed locally.
+                    self.kv_cache_manager.record_blocks_for_zeroing(
+                        request.request_id, request.num_computed_tokens
+                    )
             else:
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
+                # (Freed blocks are re-recorded for zeroing when
+                # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)

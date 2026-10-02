@@ -18,10 +18,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.host_mem import check_host_mem_after_pinning
 from vllm.v1.simple_kv_offload.manager import (
     SimpleCPUOffloadScheduler,
 )
-from vllm.v1.simple_kv_offload.host_mem import check_host_mem_after_pinning
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
 )

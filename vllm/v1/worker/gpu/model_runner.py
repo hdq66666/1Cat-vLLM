@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.simple_kv_offload.options import test_switch
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -175,6 +176,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        # Test only: GPU sleep cycles enqueued right before new KV blocks are
+        # zeroed (widens the window for a KV load racing that zeroing).
+        self._zero_delay_cycles = int(
+            test_switch("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES")
+        )
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -686,6 +692,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
+            if self._zero_delay_cycles > 0:
+                torch.cuda._sleep(self._zero_delay_cycles)
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
     def _warmup_sm70_aux_kernels(self) -> None:
