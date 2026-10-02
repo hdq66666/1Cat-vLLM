@@ -37,6 +37,10 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
 
+    # Scheduler-side CPU block count; every worker checks it against its own
+    # (0 = not set). A worker with fewer CPU blocks would DMA out of bounds.
+    num_cpu_blocks: int = 0
+
 
 @dataclass
 class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):

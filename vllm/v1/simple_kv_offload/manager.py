@@ -28,6 +28,7 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
 )
+from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -75,8 +76,10 @@ class SimpleCPUOffloadScheduler:
         scheduler_block_size: int,
         hash_block_size: int,
         lazy_offload: bool = False,
+        options: SimpleCPUOffloadOptions | None = None,
     ):
         self.vllm_config = vllm_config
+        self.options = options or SimpleCPUOffloadOptions(lazy_offload=lazy_offload)
         self.kv_cache_config = kv_cache_config
         self.enable_kv_cache_events = (
             vllm_config.kv_events_config is not None

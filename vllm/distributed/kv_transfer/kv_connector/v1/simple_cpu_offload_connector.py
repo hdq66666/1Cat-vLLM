@@ -21,14 +21,24 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.manager import (
     SimpleCPUOffloadScheduler,
 )
+from vllm.v1.simple_kv_offload.host_mem import check_host_mem_after_pinning
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
 )
+from vllm.v1.simple_kv_offload.options import (
+    DEFAULT_CPU_CAPACITY_BYTES,
+    check_test_switches,
+    parse_options,
+)
+from vllm.v1.simple_kv_offload.stats import SimpleCPUOffloadStats, build_stats
 from vllm.v1.simple_kv_offload.worker import (
     SimpleCPUOffloadWorker,
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+        KVConnectorStats,
+    )
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.block_pool import BlockPool
@@ -38,8 +48,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Default CPU capacity: 8 GB
-DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+__all__ = ["DEFAULT_CPU_CAPACITY_BYTES", "SimpleCPUOffloadConnector"]
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -56,25 +65,25 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
         extra_config = self._kv_transfer_config.kv_connector_extra_config or {}
 
-        cpu_capacity_bytes = int(
-            extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
-        )
+        options = parse_options(extra_config)
+        check_test_switches()
+        self.options = options
+
         # cpu_bytes_to_use is server-wide for compatibility;
         # cpu_bytes_to_use_per_rank overrides for per-rank capacity.
         world_size = vllm_config.parallel_config.world_size
-        cpu_capacity_per_rank = cpu_capacity_bytes // world_size
-        if "cpu_bytes_to_use_per_rank" in extra_config:
-            explicit = int(extra_config["cpu_bytes_to_use_per_rank"])
-            if explicit != cpu_capacity_per_rank:
+        cpu_capacity_per_rank = options.cpu_bytes_per_rank(world_size)
+        if options.cpu_bytes_to_use_per_rank is not None:
+            implied = options.cpu_bytes_to_use // world_size
+            if options.cpu_bytes_to_use_per_rank != implied:
                 logger.warning(
                     "cpu_bytes_to_use_per_rank (%.2f GB) != "
                     "cpu_bytes_to_use/world_size (%.2f GB). Using per-rank value.",
-                    explicit / (1024**3),
-                    cpu_capacity_per_rank / (1024**3),
+                    options.cpu_bytes_to_use_per_rank / (1024**3),
+                    implied / (1024**3),
                 )
-            cpu_capacity_per_rank = explicit
 
-        lazy_offload = bool(extra_config.get("lazy_offload", False))
+        lazy_offload = options.lazy_offload
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -88,11 +97,12 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s",
+            "per_rank=%.2f GB, world_size=%d, mode=%s, options=%s",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
             "lazy" if lazy_offload else "eager",
+            options,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -109,10 +119,16 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 lazy_offload=lazy_offload,
+                options=options,
+            )
+            # The scheduler is built after every worker pinned its CPU tier
+            # (EngineCore initializes the KV caches first).
+            check_host_mem_after_pinning(
+                options.min_host_mem_available_gib, "SimpleCPUOffloadConnector"
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config, kv_cache_config, cpu_capacity_per_rank
+                vllm_config, kv_cache_config, cpu_capacity_per_rank, options=options
             )
 
     # --- Worker-side methods ---
@@ -240,15 +256,37 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.scheduler_manager.has_pending_stores()
         return False
 
+    def has_pending_push_work(self) -> bool:
+        # Keeps the engine stepping after the last request finished until
+        # its freed blocks are offloaded and in-flight stores are completed.
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.has_pending_work()
+        return False
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self.scheduler_manager is not None:
             return self.scheduler_manager.take_events()
         return []
 
     def reset_cache(self) -> bool | None:
-        raise NotImplementedError(
-            "SimpleCPUOffloadConnector does not support reset_cache(). "
-            "reset_prefix_cache() requires synchronizing all pending "
-            "CPU offload transfers before clearing GPU prefix cache blocks, "
-            "which is not yet implemented."
-        )
+        # Only the scheduler side holds the CPU prefix cache.
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.reset()
+        return None
+
+    # --- Stats ---
+
+    def get_kv_connector_stats(self) -> "KVConnectorStats | None":
+        # Workers return their transfer stats, the scheduler side its
+        # selection / hit counters; both reset what they returned.
+        if self.worker_handler is not None:
+            return self.worker_handler.get_stats()
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_stats()
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> "KVConnectorStats | None":
+        return build_stats(data) if data is not None else SimpleCPUOffloadStats()
