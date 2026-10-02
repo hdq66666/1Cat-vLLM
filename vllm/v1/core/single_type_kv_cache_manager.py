@@ -69,6 +69,14 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool = block_pool
         self.enable_caching = enable_caching
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
+        # Record newly allocated token blocks for worker-side zeroing for plain
+        # attention specs. Managers that own one private block per request
+        # (QSA compressor ring, KPool tail) record that block themselves.
+        self._record_new_block_ids = type(kv_cache_spec) in (
+            FullAttentionSpec,
+            TQFullAttentionSpec,
+            MLAAttentionSpec,
+        )
         self.new_block_ids: list[int] = []
 
         # Mamba ``align`` block tables are sparse and mutable: committed
@@ -266,11 +274,7 @@ class SingleTypeKVCacheManager(ABC):
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
-            if type(self.kv_cache_spec) in (
-                FullAttentionSpec,
-                TQFullAttentionSpec,
-                MLAAttentionSpec,
-            ):
+            if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -298,13 +302,18 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if type(self.kv_cache_spec) in (
-                FullAttentionSpec,
-                TQFullAttentionSpec,
-                MLAAttentionSpec,
-            ):
+            if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
+
+    @property
+    def records_new_block_ids(self) -> bool:
+        """Whether this manager's new token blocks are zeroed by the worker.
+
+        False for managers that only record a private per-request block (e.g.
+        the QSA compressor ring): that block is never a KV load destination.
+        """
+        return self._record_new_block_ids
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""

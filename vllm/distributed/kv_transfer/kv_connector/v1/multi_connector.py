@@ -654,3 +654,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def reset_cache(self) -> bool:
         results = [c.reset_cache() is not False for c in self._connectors]
         return all(results)
+
+    def has_pending_push_work(self) -> bool:
+        return any(c.has_pending_push_work() for c in self._connectors)

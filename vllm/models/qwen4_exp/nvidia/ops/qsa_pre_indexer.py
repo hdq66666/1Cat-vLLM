@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused QSA pre-indexer kernel for Qwen4Exp."""
 
+import functools
+
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 
@@ -86,6 +89,7 @@ def _norm_rope(
         "num_state_blocks",
         "num_compressed_blocks",
         "num_k_work",
+        "cos_sin_rows",
     ]
 )
 def _qsa_pre_indexer_kernel(
@@ -97,6 +101,7 @@ def _qsa_pre_indexer_kernel(
     pos_stride_axis,
     pos_stride_token,
     cos_sin_ptr,
+    cos_sin_rows,
     q_norm_weight_ptr,
     k_norm_weight_ptr,
     eps,
@@ -133,6 +138,7 @@ def _qsa_pre_indexer_kernel(
     CACHE_IS_FP16: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    DEBUG_ASSERT_POSITIONS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     # K work occupies the first programs; the remaining programs tile Q. This
@@ -316,6 +322,22 @@ def _qsa_pre_indexer_kernel(
                 cached_pos_t = tl.load(tail, mask=load_cached_position, other=0)
                 cached_pos_h = tl.load(tail + 1, mask=load_cached_position, other=0)
                 cached_pos_w = tl.load(tail + 2, mask=load_cached_position, other=0)
+                if DEBUG_ASSERT_POSITIONS:
+                    tl.device_assert(
+                        (cached_pos_t >= 0)
+                        & (cached_pos_t < cos_sin_rows)
+                        & (cached_pos_h >= 0)
+                        & (cached_pos_h < cos_sin_rows)
+                        & (cached_pos_w >= 0)
+                        & (cached_pos_w < cos_sin_rows),
+                        "QSA ring position outside the cos/sin cache",
+                    )
+                # The ring tail is the only cache content that becomes an
+                # address. Clamp it to the cos/sin table so a stale or foreign
+                # page yields a wrong row instead of an out-of-bounds read.
+                cached_pos_t = tl.minimum(tl.maximum(cached_pos_t, 0), cos_sin_rows - 1)
+                cached_pos_h = tl.minimum(tl.maximum(cached_pos_h, 0), cos_sin_rows - 1)
+                cached_pos_w = tl.minimum(tl.maximum(cached_pos_w, 0), cos_sin_rows - 1)
                 pos_t = tl.where(first_in_chunk, first_pos_t.to(tl.int64), cached_pos_t)
                 pos_h = tl.where(first_in_chunk, first_pos_h.to(tl.int64), cached_pos_h)
                 pos_w = tl.where(first_in_chunk, first_pos_w.to(tl.int64), cached_pos_w)
@@ -404,6 +426,11 @@ def _qsa_pre_indexer_kernel(
                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
 
 
+@functools.cache
+def _debug_assert_positions() -> bool:
+    return envs.VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT
+
+
 def qsa_pre_indexer(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -464,6 +491,12 @@ def qsa_pre_indexer(
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+    debug_assert_positions = _debug_assert_positions()
+    # tl.device_assert only fires in Triton debug mode; leave out the integer
+    # overflow sanitizer that debug mode would also turn on.
+    debug_options = (
+        {"debug": True, "sanitize_overflow": False} if debug_assert_positions else {}
+    )
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,
         q.stride(0),
@@ -473,6 +506,7 @@ def qsa_pre_indexer(
         pos_stride_axis,
         pos_stride_token,
         cos_sin_cache,
+        cos_sin_cache.shape[0],
         q_norm_weight,
         k_norm_weight,
         eps,
@@ -509,7 +543,9 @@ def qsa_pre_indexer(
         CACHE_IS_FP16=q.dtype == torch.float16,
         MROPE_H=section[1],
         MROPE_W=section[2],
+        DEBUG_ASSERT_POSITIONS=debug_assert_positions,
         num_warps=1,
+        **debug_options,
     )
 
 
