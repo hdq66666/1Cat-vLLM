@@ -637,6 +637,15 @@ class KVConnectorBase_V1(ABC):
 
         return None
 
+    def has_pending_push_work(self) -> bool:
+        """Return True if the connector has work that requires the engine
+        main loop to keep stepping after all requests have finished (e.g.
+        CPU offload stores still to be submitted or completed).
+
+        Connectors without such background work leave this as False.
+        """
+        return False
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None

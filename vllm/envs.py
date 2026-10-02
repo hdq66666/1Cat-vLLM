@@ -772,6 +772,14 @@ if TYPE_CHECKING:
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_RESPONSES_REASONING_EFFORT_MAP: str = ""
     VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL: float = 0.0
+    VLLM_SIMPLE_KV_OFFLOAD_VERIFY: str = "off"
+    VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE: bool = False
+    VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD: bool = False
+    VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO: bool = False
+    VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY: bool = False
+    VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES: int = 0
+    VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES: int = 0
+    VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
@@ -4931,6 +4939,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
     ),
+    # SimpleCPUOffloadConnector transfer verification: "off", "sample" (check
+    # a few blocks of every transfer) or "all". Compares GPU pages with their
+    # CPU copies after loads/stores complete; blocking, diagnostics only.
+    "VLLM_SIMPLE_KV_OFFLOAD_VERIFY": env_with_choices(
+        "VLLM_SIMPLE_KV_OFFLOAD_VERIFY", "off", ["off", "sample", "all"]
+    ),
+    # Gate for the SimpleCPUOffloadConnector fault-injection switches below.
+    # They are refused at startup unless this is set.
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE": lambda: bool(
+        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE", "0"))
+    ),
+    # Test only: launch CPU->GPU loads without ordering them behind the
+    # compute stream (negative control for the load-ordering fix).
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD": lambda: bool(
+        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD", "0"))
+    ),
+    # Test only: zero the destination blocks of async KV loads as well.
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO": lambda: bool(
+        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO", "0"))
+    ),
+    # Test only: make the SimpleCPUOffload copy thread raise on its next copy.
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY": lambda: bool(
+        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY", "0"))
+    ),
+    # Test only: GPU sleep cycles enqueued on the compute stream right before
+    # new KV blocks are zeroed / right before async KV loads are launched.
+    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES": lambda: int(
+        os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES", "0")
+    ),
+    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES": lambda: int(
+        os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES", "0")
+    ),
+    # Debug only: device-side assert on out-of-range cached positions read
+    # from the QSA compressor ring (they are clamped either way).
+    "VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT": lambda: bool(
+        int(os.getenv("VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT", "0"))
+    ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -5101,6 +5146,14 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # SimpleCPUOffload diagnostics; none of them changes a compiled graph.
+        "VLLM_SIMPLE_KV_OFFLOAD_VERIFY",
+        "VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE",
+        "VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD",
+        "VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO",
+        "VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY",
+        "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES",
+        "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES",
     }
 
     from vllm.config.utils import normalize_value
