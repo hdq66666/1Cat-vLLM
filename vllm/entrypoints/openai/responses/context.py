@@ -10,6 +10,7 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final, Union
 
+from openai.types.responses import ResponseOutputItem
 from openai.types.responses.response_function_tool_call_output_item import (
     ResponseFunctionToolCallOutputItem,
 )
@@ -171,6 +172,9 @@ class SimpleContext(ConversationContext):
         self._accumulated_text: str = ""
         self._accumulated_token_ids: list[int] = []
         self._accumulated_logprobs: list = []
+        # Items already sent as output_item.done events; the final
+        # streaming response reuses them instead of reparsing.
+        self.streamed_output_items: list[ResponseOutputItem] | None = None
 
         self.num_prompt_tokens = 0
         self.num_output_tokens = 0

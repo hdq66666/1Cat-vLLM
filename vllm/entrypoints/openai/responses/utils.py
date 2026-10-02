@@ -198,9 +198,7 @@ def _construct_message_from_response_item(
         )
     elif isinstance(item, ResponseReasoningItem):
         reasoning = ""
-        if item.encrypted_content:
-            raise ValueError("Encrypted content is not supported.")
-        elif item.content and len(item.content) >= 1:
+        if item.content and len(item.content) >= 1:
             reasoning = item.content[0].text
         elif len(item.summary) >= 1:
             reasoning = item.summary[0].text
@@ -210,6 +208,12 @@ def _construct_message_from_response_item(
                 "reasoning items.",
                 item.id,
             )
+        elif item.encrypted_content:
+            # Opaque reasoning from another provider cannot be decrypted
+            # here. Drop it like a client would drop unknown reasoning,
+            # instead of failing the whole request.
+            logger.debug("Dropping reasoning item %s: encrypted content only.", item.id)
+            return None
 
         if prev_assistant_msg:
             previous_reasoning = prev_assistant_msg.get("reasoning")
@@ -257,7 +261,8 @@ def _construct_message_from_response_item(
                 if key not in _RESPONSE_MESSAGE_TRANSPORT_FIELDS
             },
         )
-    return item  # type: ignore[arg-type]
+    item_type = item.get("type") if isinstance(item, dict) else type(item).__name__
+    raise ValueError(f"Unsupported input item type: {item_type}")
 
 
 def extract_function_tool_names(tools: list[Tool]) -> frozenset[str]:

@@ -8,6 +8,7 @@ from http import HTTPStatus
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from vllm import envs
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
@@ -15,6 +16,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     StreamingResponsesResponse,
 )
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.sse_keep_alive import with_sse_keep_alive
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
@@ -73,7 +75,11 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
 
     return StreamingResponse(
-        content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
+        content=with_sse_keep_alive(
+            _convert_stream_to_sse_events(generator),
+            envs.VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL,
+        ),
+        media_type="text/event-stream",
     )
 
 

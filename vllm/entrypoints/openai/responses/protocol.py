@@ -3,6 +3,8 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import functools
+import json
 import time
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -14,6 +16,7 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -56,6 +59,7 @@ from pydantic import (
     model_validator,
 )
 
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -132,6 +136,40 @@ ResponseInputOutputMessage: TypeAlias = (
     list[ChatCompletionMessageParam] | list[ResponseRawMessageAndToken]
 )
 ResponseInputOutputItem: TypeAlias = ResponseInputItemParam | ResponseOutputItem
+
+
+@functools.cache
+def _reasoning_effort_map(raw: str) -> dict[str, str]:
+    """Parse VLLM_RESPONSES_REASONING_EFFORT_MAP (cached per value)."""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"VLLM_RESPONSES_REASONING_EFFORT_MAP is not valid JSON: {e}"
+        ) from e
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValueError(
+            "VLLM_RESPONSES_REASONING_EFFORT_MAP must be a JSON object "
+            "that maps effort names to effort names"
+        )
+    return value
+
+
+def validate_reasoning_effort_map() -> None:
+    """Raise if VLLM_RESPONSES_REASONING_EFFORT_MAP is malformed."""
+    _reasoning_effort_map(envs.VLLM_RESPONSES_REASONING_EFFORT_MAP)
+
+
+def map_reasoning_effort(effort: str | None) -> str | None:
+    """Rename a reasoning effort for the chat template, if configured."""
+    if effort is None:
+        return None
+    effort_map = _reasoning_effort_map(envs.VLLM_RESPONSES_REASONING_EFFORT_MAP)
+    return effort_map.get(effort, effort)
 
 
 def _default_input_image_details(value: Any) -> Any:
@@ -332,12 +370,16 @@ class ResponsesRequest(OpenAIBaseModel):
         continue_final = should_continue_final_message(self.input)
 
         reasoning = self.reasoning
-        reasoning_effort = None if reasoning is None else reasoning.effort
+        reasoning_effort = map_reasoning_effort(
+            None if reasoning is None else reasoning.effort
+        )
 
         extra_kwargs: dict[str, Any] = dict(
             add_generation_prompt=not continue_final,
             continue_final_message=continue_final,
-            reasoning_effort=reasoning_effort,
+            # effort "none" turns thinking off below; templates that list
+            # their supported efforts would reject "none" itself.
+            reasoning_effort=None if reasoning_effort == "none" else reasoning_effort,
         )
 
         # When reasoning is requested, activate thinking for models whose
@@ -835,6 +877,7 @@ class ResponseInProgressEvent(OpenAIResponseInProgressEvent):
 
 StreamingResponsesResponse: TypeAlias = (
     ResponseCreatedEvent
+    | ResponseErrorEvent
     | ResponseInProgressEvent
     | ResponseCompletedEvent
     | ResponseOutputItemAddedEvent
