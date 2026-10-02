@@ -19,7 +19,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+)
 
 import vllm.envs as envs
 from vllm.entrypoints.openai.engine.protocol import (
@@ -277,21 +282,93 @@ def test_complete_current_without_reference_changes_nothing():
     assert processor.close_current()[-1].item.content[0].text == "partial"
 
 
-def test_full_parse_drops_leading_message_whitespace():
-    message = ResponseOutputMessage(
+def _message(text):
+    return ResponseOutputMessage(
         id="msg_1",
         type="message",
         role="assistant",
         status="completed",
-        content=[
-            ResponseOutputText(type="output_text", text="\n\nNo.", annotations=[])
+        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+    )
+
+
+def _reasoning(text="thought"):
+    return ResponseReasoningItem(
+        id="rs_1",
+        type="reasoning",
+        summary=[],
+        content=[{"type": "reasoning_text", "text": text}],
+    )
+
+
+def test_full_parse_drops_whitespace_after_reasoning_only():
+    items = _strip_leading_message_whitespace([_reasoning(), _message("\n\nNo.")])
+    assert items[1].content[0].text == "No."
+    # Nothing but whitespace after the reasoning: the message is dropped.
+    assert len(_strip_leading_message_whitespace([_reasoning(), _message("\n ")])) == 1
+    # Without reasoning before it (e.g. a continuation), text is untouched.
+    items = _strip_leading_message_whitespace([_message(" world")])
+    assert items[0].content[0].text == " world"
+
+
+def test_stream_keeps_whitespace_when_no_reasoning_came_first():
+    processor = SimpleStreamingEventProcessor()
+    _run(processor, [DeltaMessage(content=" world"), DeltaMessage(content="\n1.")])
+    assert processor.close_current()[-1].item.content[0].text == " world\n1."
+
+
+def _call(name, arguments):
+    return ResponseFunctionToolCall(
+        type="function_call",
+        id="fc_x",
+        call_id=f"call_{name}",
+        name=name,
+        arguments=arguments,
+        status="completed",
+    )
+
+
+def test_tool_reconciliation_requires_matching_names():
+    """A full parse that found an extra call before the open one must not
+    hand the open call another call's arguments, nor send it twice."""
+    processor = SimpleStreamingEventProcessor()
+    _run(
+        processor,
+        [
+            _tool_delta(0, "call_A", "A", '{"x": 1}'),
+            _tool_delta(1, "call_C", "C", '{"x": 3}'),
         ],
     )
-    blank = message.model_copy(deep=True)
-    blank.content[0].text = "\n "
-    items = _strip_leading_message_whitespace([message, blank])
-    assert len(items) == 1
-    assert items[0].content[0].text == "No."
+    full_parse = [
+        _call("A", '{"x": 1}'),
+        _call("B", '{"x": 2}'),
+        _call("C", '{"x": 3}'),
+    ]
+    expected = OpenAIServingResponses._expected_open_item_text(processor, full_parse)
+    assert expected is None
+    processor.complete_current(expected)
+    processor.close_current()
+    assert [i.arguments for i in processor.output_items] == ['{"x": 1}', '{"x": 3}']
+    assert OpenAIServingResponses._unstreamed_items(processor, full_parse) == []
+
+
+def test_missing_trailing_calls_are_added_when_names_match():
+    processor = SimpleStreamingEventProcessor()
+    _run(processor, [_tool_delta(0, "call_A", "A", '{"x": 1}')])
+    full_parse = [_call("A", '{"x": 1}'), _call("B", '{"x": 2}')]
+    expected = OpenAIServingResponses._expected_open_item_text(processor, full_parse)
+    assert expected == '{"x": 1}'
+    processor.close_current()
+    missing = OpenAIServingResponses._unstreamed_items(processor, full_parse)
+    assert [c.name for c in missing] == ["B"]
+
+
+def test_no_message_added_when_reasoning_split_differs():
+    processor = SimpleStreamingEventProcessor()
+    _run(processor, [_tool_delta(0, "call_A", "A", '{"x": 1}')])
+    processor.close_current()
+    full_parse = [_reasoning("head"), _message("tail")]
+    assert OpenAIServingResponses._unstreamed_items(processor, full_parse) == []
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +526,70 @@ async def test_streamed_tool_call_is_complete(chunks):
         done[0].call_id,
         done[0].arguments,
     )
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_literal_end_marker_with_thinking_off_stays_content():
+    """With thinking off, '</think>' in the answer is just text."""
+    request = ResponsesRequest(input="hi", stream=True, store=False)
+    events = await _stream(
+        request, ["Qwen3 ends reasoning with ", "</think>", "; easy."], PLAIN_PROMPT
+    )
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [i.type for i in done] == ["message"]
+    text = "Qwen3 ends reasoning with </think>; easy."
+    assert done[0].content[0].text == text
+    final = events[-1].response
+    assert [i.type for i in final.output] == ["message"]
+    assert final.usage.output_tokens_details.reasoning_tokens == 0
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_tool_argument_containing_end_marker_with_thinking_off():
+    bash_tool = {
+        "type": "function",
+        "name": "bash",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    }
+    request = ResponsesRequest(
+        input="find it", stream=True, tools=[bash_tool], store=False
+    )
+    events = await _stream(
+        request,
+        [
+            "<tool_call>\n<function=bash>\n",
+            "<parameter=command>\ngrep -rn '</think>' vllm\n</parameter>\n",
+            "</function>\n</tool_call>",
+        ],
+        PLAIN_PROMPT,
+    )
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [i.type for i in done] == ["function_call"]
+    assert json.loads(done[0].arguments) == {"command": "grep -rn '</think>' vllm"}
+    assert [i.type for i in events[-1].response.output] == ["function_call"]
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_tool_choice_none_streams_markup_as_text_like_a_full_parse():
+    request = ResponsesRequest(
+        input="hi", stream=True, tools=[WEATHER_TOOL], tool_choice="none", store=False
+    )
+    chunks = [
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n",
+        "</parameter>\n</function>\n</tool_call>",
+    ]
+    events = await _stream(request, chunks, PLAIN_PROMPT)
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [i.type for i in done] == ["message"]
+    assert done[0].content[0].text == "".join(chunks)
 
 
 @needs_qwen38
