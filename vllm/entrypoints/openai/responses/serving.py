@@ -12,17 +12,17 @@ from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
+    FunctionTool,
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
-    response_text_delta_event,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -77,6 +77,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponsesResponse,
     ResponseUsage,
     StreamingResponsesResponse,
+    validate_reasoning_effort_map,
 )
 from vllm.entrypoints.openai.responses.streaming_events import (
     SimpleStreamingEventProcessor,
@@ -151,6 +152,30 @@ def _extract_allowed_tools_from_mcp_requests(
     return allowed_tools_map
 
 
+def _strip_leading_message_whitespace(
+    items: list[ResponseOutputItem],
+) -> list[ResponseOutputItem]:
+    """Drop whitespace at the start of message text.
+
+    Models that think first emit the blank lines after </think> as content.
+    The streaming path drops them as they arrive; this does the same for a
+    full parse so both paths return the same text. A message left empty is
+    removed.
+    """
+    result: list[ResponseOutputItem] = []
+    for item in items:
+        if isinstance(item, ResponseOutputMessage) and item.content:
+            first = item.content[0]
+            if isinstance(first, ResponseOutputText) and first.text != (
+                stripped := first.text.lstrip()
+            ):
+                if not stripped and len(item.content) == 1:
+                    continue
+                item.content[0] = first.model_copy(update={"text": stripped})
+        result.append(item)
+    return result
+
+
 class OpenAIServingResponses(OpenAIServing):
     def __init__(
         self,
@@ -194,6 +219,9 @@ class OpenAIServingResponses(OpenAIServing):
         )
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+
+        # Fail at startup, not on every request, if the map is malformed.
+        validate_reasoning_effort_map()
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
@@ -356,6 +384,11 @@ class OpenAIServingResponses(OpenAIServing):
         # success status before we actually start generating text :).
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        if not self.use_harmony:
+            maybe_tool_error = self._drop_unsupported_tools(request)
+            if maybe_tool_error is not None:
+                return maybe_tool_error
 
         if request.store and not self.enable_store:
             # Disable the store option.
@@ -601,6 +634,40 @@ class OpenAIServingResponses(OpenAIServing):
             request_metadata,
         )
 
+    def _drop_unsupported_tools(
+        self, request: ResponsesRequest
+    ) -> ErrorResponse | None:
+        """Keep only function tools when no tool server can run the others.
+
+        Hosted tools (web_search, local_shell, custom, namespace, ...) have no
+        implementation here. Rendering them into the prompt shows the model
+        nameless pseudo-functions, and tool_choice="required" with them fails
+        in the tool parser. Clients such as coding agents send some of them
+        by default, so they are ignored rather than rejected.
+        """
+        if self.tool_server is not None or not request.tools:
+            return None
+        function_tools = [t for t in request.tools if isinstance(t, FunctionTool)]
+        if len(function_tools) == len(request.tools):
+            return None
+        logger.info(
+            "Ignoring Responses API tools of type %s: only function tools "
+            "are supported without a tool server.",
+            sorted({t.type for t in request.tools if not isinstance(t, FunctionTool)}),
+        )
+        request.tools = function_tools
+        if not function_tools:
+            if request.tool_choice == "required":
+                return self.create_error_response(
+                    err_type="invalid_request_error",
+                    message="tool_choice='required' needs at least one function "
+                    "tool; hosted tool types are not supported.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    param="tool_choice",
+                )
+            request.tool_choice = "none"
+        return None
+
     async def _make_request(
         self,
         request: ResponsesRequest,
@@ -845,7 +912,18 @@ class OpenAIServingResponses(OpenAIServing):
             if final_output.finish_reason == "length":
                 status = "incomplete"
 
-            output = self._make_response_output_items(request, final_output, tokenizer)
+            streamed_items = context.streamed_output_items
+            self._log_final_output(
+                request, final_output, is_streaming=streamed_items is not None
+            )
+            if streamed_items is not None:
+                # The client already received these items; reparsing would
+                # mint new ids and could disagree with the stream.
+                output = list(streamed_items)
+            else:
+                output = self._make_response_output_items(
+                    request, final_output, tokenizer
+                )
 
             if request.enable_response_messages:
                 input_messages = context.input_messages
@@ -876,6 +954,10 @@ class OpenAIServingResponses(OpenAIServing):
             )
             accumulated = getattr(context, "_accumulated_token_ids", []) or []
             num_reasoning_tokens = reasoning_parser.count_reasoning_tokens(accumulated)
+            if num_reasoning_tokens == 0:
+                num_reasoning_tokens = self._count_prompt_opened_reasoning_tokens(
+                    reasoning_parser, accumulated, output, tokenizer
+                )
 
         usage = ResponseUsage(
             input_tokens=num_prompt_tokens,
@@ -985,32 +1067,50 @@ class OpenAIServingResponses(OpenAIServing):
             )
         return out
 
-    def _create_stream_response_logprobs(
+    def _log_final_output(
         self,
-        token_ids: Sequence[int],
-        logprobs: SampleLogprobs | None,
-        tokenizer: TokenizerLike,
-        top_logprobs: int | None = None,
-    ) -> list[response_text_delta_event.Logprob]:
-        lgs = self._create_response_logprobs(
-            token_ids=token_ids,
-            logprobs=logprobs,
-            tokenizer=tokenizer,
-            top_logprobs=top_logprobs,
-        )
-        return [
-            response_text_delta_event.Logprob(
-                token=lg.token,
-                logprob=lg.logprob,
-                top_logprobs=[
-                    response_text_delta_event.LogprobTopLogprob(
-                        token=tl.token, logprob=tl.logprob
-                    )
-                    for tl in lg.top_logprobs
-                ],
+        request: ResponsesRequest,
+        final_output: CompletionOutput,
+        is_streaming: bool,
+    ) -> None:
+        if self.enable_log_outputs and self.request_logger:
+            self.request_logger.log_outputs(
+                request_id=request.request_id,
+                outputs=final_output.text,
+                output_token_ids=final_output.token_ids,
+                finish_reason=final_output.finish_reason,
+                is_streaming=is_streaming,
+                delta=False,
             )
-            for lg in lgs
-        ]
+
+    @staticmethod
+    def _count_prompt_opened_reasoning_tokens(
+        reasoning_parser: Any,
+        token_ids: Sequence[int],
+        output: Sequence[ResponseOutputItem],
+        tokenizer: TokenizerLike,
+    ) -> int:
+        """Count reasoning tokens when the template opened the think block.
+
+        count_reasoning_tokens() only counts tokens between a start and an
+        end marker in the output. Templates that put <think> in the prompt
+        (Qwen3.5 and later) leave only </think> in the output, so it returns
+        0. Here the reasoning is everything before the end marker, or, when
+        the output has none (cut off, or ended by a tool call), the tokens
+        of the parsed reasoning text.
+        """
+        reasoning_items = [item for item in output if item.type == "reasoning"]
+        if not reasoning_items:
+            return 0
+        end_token_id = getattr(reasoning_parser, "end_token_id", None)
+        if end_token_id is not None and end_token_id in token_ids:
+            return list(token_ids).index(end_token_id)
+        text = "".join(
+            part.text for item in reasoning_items for part in (item.content or [])
+        )
+        if not text:
+            return 0
+        return len(tokenizer.encode(text, add_special_tokens=False))
 
     def _make_response_output_items(
         self,
@@ -1018,17 +1118,6 @@ class OpenAIServingResponses(OpenAIServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
     ) -> list[ResponseOutputItem]:
-        # Log complete response if output logging is enabled
-        if self.enable_log_outputs and self.request_logger:
-            self.request_logger.log_outputs(
-                request_id=request.request_id,
-                outputs=final_output.text,
-                output_token_ids=final_output.token_ids,
-                finish_reason=final_output.finish_reason,
-                is_streaming=False,
-                delta=False,
-            )
-
         # Compute logprobs if requested
         logprobs = None
         if request.is_include_output_logprobs() and final_output.logprobs:
@@ -1045,13 +1134,15 @@ class OpenAIServingResponses(OpenAIServing):
             parser = self.parser(
                 tokenizer, request.tools, chat_template_kwargs=chat_template_kwargs
             )
-            return parser.extract_response_outputs(
-                model_output=final_output.text,
-                model_output_token_ids=final_output.token_ids,
-                request=request,
-                enable_auto_tools=self.enable_auto_tools,
-                tool_call_id_type=self.tool_call_id_type,
-                logprobs=logprobs,
+            return _strip_leading_message_whitespace(
+                parser.extract_response_outputs(
+                    model_output=final_output.text,
+                    model_output_token_ids=final_output.token_ids,
+                    request=request,
+                    enable_auto_tools=self.enable_auto_tools,
+                    tool_call_id_type=self.tool_call_id_type,
+                    logprobs=logprobs,
+                )
             )
 
         # Fallback when no parser is configured
@@ -1358,6 +1449,16 @@ class OpenAIServingResponses(OpenAIServing):
                 logger.exception("Background task for %s was cancelled", response_id)
         return response
 
+    @staticmethod
+    def _make_stream_error_event(message: str, code: str) -> ResponseErrorEvent:
+        return ResponseErrorEvent(
+            type="error",
+            sequence_number=-1,
+            code=code,
+            message=message,
+            param=None,
+        )
+
     def _make_not_found_error(self, response_id: str) -> ErrorResponse:
         return self.create_error_response(
             err_type="invalid_request_error",
@@ -1391,12 +1492,10 @@ class OpenAIServingResponses(OpenAIServing):
             else None
         )
 
-        def _get_logprobs(
-            output: CompletionOutput,
-        ) -> list[response_text_delta_event.Logprob]:
+        def _get_logprobs(output: CompletionOutput) -> list[Logprob]:
             if not request.is_include_output_logprobs():
                 return []
-            return self._create_stream_response_logprobs(
+            return self._create_response_logprobs(
                 token_ids=output.token_ids,
                 logprobs=output.logprobs,
                 tokenizer=tokenizer,
@@ -1426,7 +1525,10 @@ class OpenAIServingResponses(OpenAIServing):
             if not delta_message:
                 continue
 
-            for dm in split_delta(delta_message):
+            for split_dm in split_delta(delta_message):
+                dm = processor.strip_leading_content_whitespace(split_dm)
+                if dm is None:
+                    continue
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:
                     continue
@@ -1440,8 +1542,113 @@ class OpenAIServingResponses(OpenAIServing):
                 for event in processor.emit_delta(dm, output, _get_logprobs):
                     yield _increment_sequence_number_and_return(event)
 
+        assert isinstance(context, SimpleContext)
+        full_parse = self._full_parse_output_items(request, context, tokenizer)
+        expected_text = self._expected_open_item_text(processor, full_parse)
+        for event in processor.complete_current(expected_text):
+            yield _increment_sequence_number_and_return(event)
         for event in processor.close_current():
             yield _increment_sequence_number_and_return(event)
+        for item in self._unstreamed_items(processor, full_parse):
+            for event in processor.emit_item(item):
+                yield _increment_sequence_number_and_return(event)
+        context.streamed_output_items = processor.output_items
+
+    def _full_parse_output_items(
+        self,
+        request: ResponsesRequest,
+        context: SimpleContext,
+        tokenizer: TokenizerLike,
+    ) -> list[ResponseOutputItem] | None:
+        """Parse the complete output once, as a non-streaming request would.
+
+        Used at the end of a stream to check what the incremental parsers
+        emitted. Returns None when there is no parser or no output.
+        """
+        final_res = context.final_output
+        if self.parser is None or final_res is None or not final_res.outputs:
+            return None
+        return self._make_response_output_items(
+            request, final_res.outputs[0], tokenizer
+        )
+
+    @staticmethod
+    def _expected_open_item_text(
+        processor: SimpleStreamingEventProcessor,
+        full_parse: list[ResponseOutputItem] | None,
+    ) -> str | None:
+        """Full-parse text of the item that is still open at end of stream.
+
+        Returns None when there is nothing to compare against, or when the
+        open item cannot be matched to exactly one item of the full parse.
+        """
+        state = processor.state.current_state
+        if state == _StateType.NONE or full_parse is None:
+            return None
+        streamed = processor.output_items
+        if state == _StateType.TOOL_CALL:
+            position = sum(1 for item in streamed if item.type == "function_call")
+            calls = [
+                item
+                for item in full_parse
+                if isinstance(item, ResponseFunctionToolCall)
+            ]
+            if position < len(calls):
+                return calls[position].arguments
+            return None
+        if state == _StateType.REASONING:
+            reasoning = [item for item in full_parse if item.type == "reasoning"]
+            if len(reasoning) != 1 or any(i.type == "reasoning" for i in streamed):
+                return None
+            return "".join(part.text for part in reasoning[0].content or [])
+        # CONTENT: a full parse merges all text into one message, so only a
+        # stream with a single message item can be compared.
+        messages = [
+            item for item in full_parse if isinstance(item, ResponseOutputMessage)
+        ]
+        if len(messages) != 1 or any(i.type == "message" for i in streamed):
+            return None
+        return "".join(
+            part.text
+            for part in messages[0].content
+            if isinstance(part, ResponseOutputText)
+        )
+
+    @staticmethod
+    def _unstreamed_items(
+        processor: SimpleStreamingEventProcessor,
+        full_parse: list[ResponseOutputItem] | None,
+    ) -> list[ResponseOutputItem]:
+        """Items the full parse found that the stream never produced.
+
+        The incremental tool parser can return nothing at all when a whole
+        tool call arrives in one delta (e.g. a large first delta), and then
+        never recovers. Clients that build the turn from stream events only
+        would silently lose the call, so it is sent as a complete item.
+        """
+        if full_parse is None:
+            return []
+        streamed = processor.output_items
+        missing: list[ResponseOutputItem] = []
+        if not any(item.type == "message" for item in streamed):
+            missing.extend(
+                item
+                for item in full_parse
+                if isinstance(item, ResponseOutputMessage) and item.content
+            )
+        streamed_calls = sum(1 for item in streamed if item.type == "function_call")
+        calls = [
+            item for item in full_parse if isinstance(item, ResponseFunctionToolCall)
+        ]
+        missing.extend(calls[streamed_calls:])
+        if missing:
+            logger.warning(
+                "Streaming parser missed %d output item(s) (%s); sending them "
+                "at the end of the stream.",
+                len(missing),
+                ", ".join(item.type for item in missing),
+            )
+        return missing
 
     async def _process_harmony_streaming_events(
         self,
@@ -1557,29 +1764,51 @@ class OpenAIServingResponses(OpenAIServing):
                     _increment_sequence_number_and_return,
                 ):
                     yield event_data
+
+                async def empty_async_generator():
+                    # A hack to trick Python to think this is a generator but
+                    # in fact it immediately returns.
+                    if False:
+                        yield
+
+                final_response = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    empty_async_generator(),
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
+                )
             except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
                 yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                    self._make_stream_error_event(str(e), "server_error")
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # The response has already started with HTTP 200, so the
+                # failure can only be reported in the stream. Without a
+                # terminal event, clients see a truncated stream and retry
+                # with no idea what went wrong.
+                logger.exception(
+                    "Error while streaming response %s", request.request_id
+                )
+                yield _increment_sequence_number_and_return(
+                    self._make_stream_error_event(str(e), "server_error")
                 )
                 return
 
-            async def empty_async_generator():
-                # A hack to trick Python to think this is a generator but
-                # in fact it immediately returns.
-                if False:
-                    yield
-
-            final_response = await self.responses_full_generator(
-                request,
-                sampling_params,
-                empty_async_generator(),
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-                created_time=created_time,
-            )
+            if isinstance(final_response, ErrorResponse):
+                yield _increment_sequence_number_and_return(
+                    self._make_stream_error_event(
+                        final_response.error.message,
+                        str(final_response.error.type),
+                    )
+                )
+                return
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",

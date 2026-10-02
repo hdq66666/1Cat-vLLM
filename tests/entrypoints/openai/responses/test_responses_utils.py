@@ -266,8 +266,8 @@ class TestResponsesUtils:
             encrypted_content="TOP_SECRET_MESSAGE",
             status=None,
         )
-        with pytest.raises(ValueError):
-            construct_chat_messages_with_tool_call([item])
+        # Opaque reasoning from another provider is dropped, not rejected.
+        assert construct_chat_messages_with_tool_call([item]) == []
 
         output_item = ResponseOutputMessage(
             id="msg_bf585bbbe3d500e0",
@@ -392,8 +392,8 @@ class TestReasoningItemContentPriority:
         formatted = _single_chat_message(item)
         assert formatted["reasoning"] == ""
 
-    def test_encrypted_content_raises(self):
-        """Encrypted content should still raise ValueError."""
+    def test_encrypted_content_ignored_when_text_is_present(self):
+        """Readable content wins over encrypted content."""
         item = ResponseReasoningItem(
             id="reasoning_6",
             summary=[
@@ -412,8 +412,8 @@ class TestReasoningItemContentPriority:
             encrypted_content="ENCRYPTED",
             status=None,
         )
-        with pytest.raises(ValueError):
-            construct_chat_messages_with_tool_call([item])
+        formatted = _single_chat_message(item)
+        assert formatted["reasoning"] == "Some content"
 
     @patch("vllm.entrypoints.openai.responses.utils.logger")
     def test_summary_with_multiple_entries_uses_first(self, mock_logger):

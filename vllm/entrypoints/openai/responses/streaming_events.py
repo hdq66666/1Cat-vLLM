@@ -39,6 +39,7 @@ from openai.types.responses import (
     ResponseMcpCallArgumentsDoneEvent,
     ResponseMcpCallCompletedEvent,
     ResponseMcpCallInProgressEvent,
+    ResponseOutputItem,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
@@ -52,6 +53,7 @@ from openai.types.responses import (
     ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent,
     response_function_web_search,
+    response_output_text,
     response_text_delta_event,
 )
 from openai.types.responses.response_output_item import McpCall
@@ -60,6 +62,7 @@ from openai.types.responses.response_reasoning_item import (
 )
 from openai_harmony import Message as HarmonyMessage
 
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage, DeltaToolCall
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -830,10 +833,12 @@ class SimpleStreamingState:
     current_item_id: str = ""
     content_index: int = 0
     accumulated_text: str = ""
+    accumulated_logprobs: list[response_output_text.Logprob] = field(
+        default_factory=list
+    )
     tool_call_id: str = ""
     tool_call_name: str = ""
     tool_call_index: int | None = None
-    has_emitted_tool_call_delta: bool = False
     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
 
 
@@ -841,9 +846,10 @@ def emit_simple_content_open(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.CONTENT
-    state.current_item_id = random_uuid()
+    state.current_item_id = f"msg_{random_uuid()}"
     state.content_index = 0
     state.accumulated_text = ""
+    state.accumulated_logprobs = []
     return [
         ResponseOutputItemAddedEvent(
             type="response.output_item.added",
@@ -873,12 +879,32 @@ def emit_simple_content_open(
     ]
 
 
+def _to_stream_logprobs(
+    logprobs: list[response_output_text.Logprob],
+) -> list[response_text_delta_event.Logprob]:
+    return [
+        response_text_delta_event.Logprob(
+            token=lp.token,
+            logprob=lp.logprob,
+            top_logprobs=[
+                response_text_delta_event.LogprobTopLogprob(
+                    token=tl.token, logprob=tl.logprob
+                )
+                for tl in lp.top_logprobs
+            ],
+        )
+        for lp in logprobs
+    ]
+
+
 def emit_simple_content_delta(
     state: SimpleStreamingState,
     delta: str,
-    logprobs: list[response_text_delta_event.Logprob] | None = None,
+    logprobs: list[response_output_text.Logprob] | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
+    if logprobs:
+        state.accumulated_logprobs.extend(logprobs)
     return [
         ResponseTextDeltaEvent(
             type="response.output_text.delta",
@@ -887,7 +913,7 @@ def emit_simple_content_delta(
             output_index=state.output_index,
             item_id=state.current_item_id,
             delta=delta,
-            logprobs=logprobs or [],
+            logprobs=_to_stream_logprobs(logprobs or []),
         )
     ]
 
@@ -899,6 +925,7 @@ def emit_simple_content_done(
         type="output_text",
         text=state.accumulated_text,
         annotations=[],
+        logprobs=state.accumulated_logprobs or None,
     )
     events: list[StreamingResponsesResponse] = [
         ResponseTextDoneEvent(
@@ -928,7 +955,6 @@ def emit_simple_content_done(
                 role="assistant",
                 content=[part] if state.accumulated_text else [],
                 status="completed",
-                summary=[],
             ),
         ),
     ]
@@ -941,7 +967,7 @@ def emit_simple_reasoning_open(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.REASONING
-    state.current_item_id = random_uuid()
+    state.current_item_id = f"rs_{random_uuid()}"
     state.content_index = 0
     state.accumulated_text = ""
     return [
@@ -956,16 +982,13 @@ def emit_simple_reasoning_open(
                 status="in_progress",
             ),
         ),
-        ResponseReasoningPartAddedEvent(
-            type="response.reasoning_part.added",
+        ResponseContentPartAddedEvent(
+            type="response.content_part.added",
             sequence_number=-1,
             output_index=state.output_index,
             item_id=state.current_item_id,
             content_index=state.content_index,
-            part=ResponseReasoningTextContent(
-                text="",
-                type="reasoning_text",
-            ),
+            part={"text": "", "type": "reasoning_text"},
         ),
     ]
 
@@ -1003,13 +1026,13 @@ def emit_simple_reasoning_done(
             content_index=state.content_index,
             text=state.accumulated_text,
         ),
-        ResponseReasoningPartDoneEvent(
-            type="response.reasoning_part.done",
+        ResponseContentPartDoneEvent(
+            type="response.content_part.done",
             sequence_number=-1,
             item_id=state.current_item_id,
             output_index=state.output_index,
             content_index=state.content_index,
-            part=part,
+            part=part.model_dump(),
         ),
         ResponseOutputItemDoneEvent(
             type="response.output_item.done",
@@ -1033,14 +1056,15 @@ def emit_simple_tool_call_open(
     state: SimpleStreamingState,
     name: str,
     index: int | None,
+    call_id: str | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.TOOL_CALL
-    state.current_item_id = random_uuid()
-    state.tool_call_id = f"call_{random_uuid()}"
+    state.current_item_id = f"fc_{random_uuid()}"
+    # Use the parser's id so it matches what a non-streaming parse returns.
+    state.tool_call_id = call_id or make_tool_call_id()
     state.tool_call_name = name
     state.tool_call_index = index
     state.accumulated_text = ""
-    state.has_emitted_tool_call_delta = False
     return [
         ResponseOutputItemAddedEvent(
             type="response.output_item.added",
@@ -1063,7 +1087,6 @@ def emit_simple_tool_call_delta(
     delta: str,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
-    state.has_emitted_tool_call_delta = True
     return [
         ResponseFunctionCallArgumentsDeltaEvent(
             type="response.function_call_arguments.delta",
@@ -1078,19 +1101,15 @@ def emit_simple_tool_call_delta(
 def emit_simple_tool_call_done(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
-    events: list[StreamingResponsesResponse] = []
-    if state.has_emitted_tool_call_delta:
-        events.append(
-            ResponseFunctionCallArgumentsDoneEvent(
-                type="response.function_call_arguments.done",
-                sequence_number=-1,
-                output_index=state.output_index,
-                item_id=state.current_item_id,
-                arguments=state.accumulated_text,
-                name=state.tool_call_name,
-            )
-        )
-    events.append(
+    events: list[StreamingResponsesResponse] = [
+        ResponseFunctionCallArgumentsDoneEvent(
+            type="response.function_call_arguments.done",
+            sequence_number=-1,
+            output_index=state.output_index,
+            item_id=state.current_item_id,
+            arguments=state.accumulated_text,
+            name=state.tool_call_name,
+        ),
         ResponseOutputItemDoneEvent(
             type="response.output_item.done",
             sequence_number=-1,
@@ -1104,7 +1123,7 @@ def emit_simple_tool_call_done(
                 call_id=state.tool_call_id,
             ),
         ),
-    )
+    ]
     state.output_index += 1
     state.current_state = _StateType.NONE
     return events
@@ -1185,6 +1204,57 @@ class SimpleStreamingEventProcessor:
 
     def __init__(self, state: SimpleStreamingState | None = None) -> None:
         self.state = state or SimpleStreamingState()
+        # Items already sent in output_item.done events, in output order.
+        # The final response reuses them so its ids and contents match the
+        # stream instead of coming from a second parse of the output.
+        self.output_items: list[ResponseOutputItem] = []
+
+    def strip_leading_content_whitespace(
+        self, delta_message: DeltaMessage
+    ) -> DeltaMessage | None:
+        """Drop whitespace at the start of a message item.
+
+        Models that think first emit the blank lines that follow </think> as
+        content, so a message would otherwise start with "\\n\\n". Returns
+        None when nothing is left to stream.
+        """
+        if (
+            self.state.current_state == _StateType.CONTENT
+            or delta_message.content is None
+            or delta_message.reasoning is not None
+            or delta_message.tool_calls
+        ):
+            return delta_message
+        content = delta_message.content.lstrip()
+        if not content:
+            return None
+        if content == delta_message.content:
+            return delta_message
+        return DeltaMessage(content=content)
+
+    def complete_current(
+        self, expected_text: str | None
+    ) -> list[StreamingResponsesResponse]:
+        """Bring the open item's text up to *expected_text* before closing.
+
+        The streaming tool parser can hold back the end of a tool call when
+        the last delta carries several tokens (speculative decoding), and the
+        reasoning or content parsers can hold back a partial marker. When the
+        streamed text is a prefix of the text a full parse of the output
+        produced, the missing suffix is streamed as one more delta. Otherwise
+        the done events carry the full-parse text.
+        """
+        if expected_text is None or self.state.current_state == _StateType.NONE:
+            return []
+        streamed = self.state.accumulated_text
+        if expected_text == streamed:
+            return []
+        if not expected_text.startswith(streamed):
+            self.state.accumulated_text = expected_text
+            return []
+        suffix = expected_text[len(streamed) :]
+        handlers = self._STATE_HANDLERS[self.state.current_state]
+        return handlers.delta_fn(self.state, suffix)
 
     def resolve_target_state(
         self, delta_message: DeltaMessage
@@ -1227,12 +1297,45 @@ class SimpleStreamingEventProcessor:
             and self.state.tool_call_index != tool_call.index
         )
 
+    def emit_item(self, item: ResponseOutputItem) -> list[StreamingResponsesResponse]:
+        """Stream a complete message or function call as one item.
+
+        For items the delta parsers never produced; any open item is closed
+        first.
+        """
+        events = self.close_current()
+        if isinstance(item, ResponseFunctionToolCall):
+            handlers = self._STATE_HANDLERS[_StateType.TOOL_CALL]
+            events += handlers.open_fn(self.state, item.name, None, item.call_id)
+            if item.arguments:
+                events += handlers.delta_fn(self.state, item.arguments)
+        elif isinstance(item, ResponseOutputMessage):
+            handlers = self._STATE_HANDLERS[_StateType.CONTENT]
+            events += handlers.open_fn(self.state)
+            text = "".join(
+                part.text
+                for part in item.content
+                if isinstance(part, ResponseOutputText)
+            )
+            if text:
+                events += handlers.delta_fn(self.state, text)
+        else:
+            return events
+        events += self.close_current()
+        return events
+
     def close_current(self) -> list[StreamingResponsesResponse]:
         """Close the current state and emit its 'done' event sequence."""
         handlers = self._STATE_HANDLERS.get(self.state.current_state)
         if handlers is None:
             return []
-        return handlers.done_fn(self.state)
+        events = handlers.done_fn(self.state)
+        self.output_items.extend(
+            event.item
+            for event in events
+            if isinstance(event, ResponseOutputItemDoneEvent)
+        )
+        return events
 
     def open(
         self, target_state: _StateType, tool_call: Any = None
@@ -1242,7 +1345,7 @@ class SimpleStreamingEventProcessor:
         if target_state == _StateType.TOOL_CALL:
             assert tool_call is not None
             return handlers.open_fn(
-                self.state, tool_call.function.name, tool_call.index
+                self.state, tool_call.function.name, tool_call.index, tool_call.id
             )
         return handlers.open_fn(self.state)
 
@@ -1250,9 +1353,7 @@ class SimpleStreamingEventProcessor:
         self,
         delta_message: DeltaMessage,
         output: CompletionOutput,
-        get_logprobs: Callable[
-            [CompletionOutput], list[response_text_delta_event.Logprob]
-        ]
+        get_logprobs: Callable[[CompletionOutput], list[response_output_text.Logprob]]
         | None = None,
     ) -> list[StreamingResponsesResponse]:
         """Emit incremental events for the current state from the delta."""
