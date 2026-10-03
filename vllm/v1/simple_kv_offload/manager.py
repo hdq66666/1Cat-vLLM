@@ -711,12 +711,11 @@ class SimpleCPUOffloadScheduler:
             bhash = node.block_hash
             if bhash is None or node.is_null:
                 pass
-            elif (cached_blk := cpu_cached.get_one_block(bhash)) is not None:
-                # Already on CPU: refresh its LRU position, the GPU copy is
-                # being reused or kept.
-                if cached_blk.ref_cnt == 0:
-                    cpu_pool.touch([cached_blk])
-                    cpu_pool.free_blocks([cached_blk])
+            elif cpu_cached.get_one_block(bhash) is not None:
+                # Already on CPU. Visiting a free GPU block says nothing about
+                # its use, so CPU recency is left alone: request_finished()
+                # refreshes what requests actually used.
+                pass
             elif bhash in self._lazy_inflight_hashes:
                 stats.add(INFLIGHT_SKIPPED)
             elif skip_restore and self._gpu_offloaded.get(node.block_id) == (
@@ -1047,8 +1046,45 @@ class SimpleCPUOffloadScheduler:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
-        so the scheduler can free blocks immediately. ``block_ids`` only feed
-        the LOAD_DST_RECENTLY_FREED diagnostic."""
+        so the scheduler can free blocks immediately."""
+        self._refresh_cpu_recency((block_ids,))
+        return self._request_finished(request, block_ids)
+
+    def _refresh_cpu_recency(self, block_ids_by_group: tuple[list[int], ...]) -> None:
+        """Move the CPU copies of a finishing request's blocks to the MRU end
+        of the CPU LRU, prefix head last so it is evicted last.
+
+        CPU recency follows use, like the GPU prefix cache: without this a
+        conversation restored from CPU and used again would keep its old
+        position and be evicted before blocks that merely sat in the GPU
+        free queue. Runs before the scheduler frees the request's GPU blocks,
+        so their hashes are still set.
+        """
+        if not self._lazy_mode or self._gpu_block_pool is None:
+            return
+        gpu_blocks = self._gpu_block_pool.blocks
+        cpu_cached = self.cpu_block_pool.cached_block_hash_to_block
+        refresh: list[KVCacheBlock] = []
+        # Later groups first and each group tail first: the first group's
+        # (full attention) head ends up most recent.
+        for group_ids in reversed(block_ids_by_group):
+            for block_id in reversed(group_ids):
+                block = gpu_blocks[block_id]
+                bhash = block.block_hash
+                if block.is_null or bhash is None:
+                    continue
+                cpu_blk = cpu_cached.get_one_block(bhash)
+                if cpu_blk is not None and cpu_blk.ref_cnt == 0:
+                    refresh.append(cpu_blk)
+        if refresh:
+            self.cpu_block_pool.touch(refresh)
+            self.cpu_block_pool.free_blocks(refresh)
+
+    def _request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
         req_id = request.request_id
 
         # Diagnostics: count loads into pages of just-finished requests
@@ -1086,7 +1122,8 @@ class SimpleCPUOffloadScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(
+        self._refresh_cpu_recency(block_ids)
+        return self._request_finished(
             request, block_ids=[bid for group in block_ids for bid in group]
         )
 
@@ -1118,10 +1155,10 @@ class SimpleCPUOffloadScheduler:
                     self._load_event_to_reqs.pop(state.load_event, None)
 
         if state.transfer_meta is not None:
-            # Free CPU touch refs
+            # Free CPU touch refs, prefix head last (most recent in the LRU).
             self.cpu_block_pool.free_blocks(
                 self.cpu_block_pool.blocks[bid]
-                for bid in state.transfer_meta.cpu_block_ids
+                for bid in reversed(state.transfer_meta.cpu_block_ids)
             )
             # Free GPU touch refs
             assert self._gpu_block_pool is not None
