@@ -48,6 +48,17 @@ class SimpleCPUOffloadOptions:
     # A load or store that does not complete within this many seconds is
     # treated as a dead transfer and fails the engine.
     transfer_timeout_s: float = 60.0
+    # A CPU hit is admitted only while the GPU pool can also take the
+    # request's first compute step after the load plus a margin for the
+    # running requests; otherwise it is deferred. After cpu_hit_admission_wait_s
+    # the hit is given up as soon as a cold start of the request would be
+    # admitted (so the request is never held back behind what the cold path
+    # would do); after cpu_hit_admission_max_wait_s it is given up regardless.
+    cpu_hit_admission_wait_s: float = 10.0
+    cpu_hit_admission_max_wait_s: float = 60.0
+    # Margin of free GPU blocks kept for the running requests when admitting
+    # a CPU hit. None = one block per request scheduled in the last step.
+    cpu_hit_admission_margin_blocks: int | None = None
 
     def cpu_bytes_per_rank(self, world_size: int) -> int:
         if self.cpu_bytes_to_use_per_rank is not None:
@@ -125,14 +136,15 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["max_store_blocks_per_step"] = _as_int(
             "max_store_blocks_per_step", cfg["max_store_blocks_per_step"], 1
         )
-    if cfg.get("store_reserve_free_blocks") is not None:
-        kwargs["store_reserve_free_blocks"] = _as_int(
-            "store_reserve_free_blocks", cfg["store_reserve_free_blocks"], 0
-        )
+    for key in ("store_reserve_free_blocks", "cpu_hit_admission_margin_blocks"):
+        if cfg.get(key) is not None:
+            kwargs[key] = _as_int(key, cfg[key], 0)
     for key, minimum in (
         ("min_host_mem_available_gib", 0.0),
         ("host_mem_warn_gib", 0.0),
         ("transfer_timeout_s", 1.0),
+        ("cpu_hit_admission_wait_s", 0.0),
+        ("cpu_hit_admission_max_wait_s", 0.0),
     ):
         if key in cfg:
             kwargs[key] = _as_float(key, cfg[key], minimum)

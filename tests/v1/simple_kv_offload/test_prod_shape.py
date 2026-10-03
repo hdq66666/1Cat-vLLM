@@ -166,11 +166,14 @@ def _manager_config(use_eagle: bool) -> SimpleNamespace:
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=MAX_NUM_SEQS,
+            long_prefill_token_threshold=0,
+            scheduler_reserve_full_isl=True,
         ),
         speculative_config=(
             SimpleNamespace(use_eagle_kv_cache=lambda: True) if use_eagle else None
         ),
         max_in_flight_tokens=2 * MAX_NUM_BATCHED_TOKENS,
+        num_lookahead_tokens=NUM_SPEC_TOKENS if use_eagle else 0,
     )
 
 
