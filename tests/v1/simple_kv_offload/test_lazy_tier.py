@@ -446,7 +446,10 @@ def test_load_destinations_are_not_stored_back() -> None:
     # The scheduler caches the loaded blocks, then the request finishes.
     gpu_pool.cache_full_blocks(req2, dst, 0, 2, BLOCK_SIZE, 0)
     for block in dst:
-        assert sched._gpu_offloaded[block.block_id] == block.block_hash
+        assert sched._gpu_offloaded[block.block_id] == (
+            block.block_hash,
+            block.alloc_generation,
+        )
         _evict_cpu_copy(sched, block)
     gpu_pool.free_blocks(reversed(dst))
 
