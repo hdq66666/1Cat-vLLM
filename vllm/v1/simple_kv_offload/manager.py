@@ -206,10 +206,11 @@ class SimpleCPUOffloadScheduler:
         # Lazy mode: the last walk stopped before the end of the free queue
         # with blocks left to store (keeps an idle engine stepping).
         self._lazy_backlog = False
-        # GPU block id -> hash of the content it holds that was already
-        # written to (or read from) CPU. Stale entries never match because
-        # the block gets a new hash when it is reused.
-        self._gpu_offloaded: dict[int, BlockHashWithGroupId] = {}
+        # GPU block id -> (hash, allocation generation) of the content it
+        # holds that was already written to (or read from) CPU. An entry only
+        # matches within the residency it was recorded in, even if a later
+        # residency recomputes the same content (same hash).
+        self._gpu_offloaded: dict[int, tuple[BlockHashWithGroupId, int]] = {}
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
         # GPU blocks pinned by in-flight stores.
         self._num_store_pinned_blocks = 0
@@ -307,6 +308,11 @@ class SimpleCPUOffloadScheduler:
         # is dropped first.
         if stale := self._pending_cpu_hits.pop(request.request_id, None):
             self._free_pending_cpu_hit(stale)
+
+        # Requests that bypass the GPU prefix cache (e.g. prompt_logprobs)
+        # must compute every prompt token: no CPU hit either.
+        if request.skip_reading_prefix_cache:
+            return 0, False
 
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped_hashes:]
@@ -513,7 +519,10 @@ class SimpleCPUOffloadScheduler:
         # The loaded content is already on CPU: do not store it back.
         for gpu_block_id, cpu_blk in zip(gpu_block_ids, cpu_blocks_to_touch):
             assert cpu_blk.block_hash is not None
-            self._gpu_offloaded[gpu_block_id] = cpu_blk.block_hash
+            self._gpu_offloaded[gpu_block_id] = (
+                cpu_blk.block_hash,
+                gpu_blocks[gpu_block_id].alloc_generation,
+            )
 
         self._stats.add(LOAD_REQUESTS)
         if self._recently_freed:
@@ -710,7 +719,10 @@ class SimpleCPUOffloadScheduler:
                     cpu_pool.free_blocks([cached_blk])
             elif bhash in self._lazy_inflight_hashes:
                 stats.add(INFLIGHT_SKIPPED)
-            elif skip_restore and self._gpu_offloaded.get(node.block_id) == bhash:
+            elif skip_restore and self._gpu_offloaded.get(node.block_id) == (
+                bhash,
+                node.alloc_generation,
+            ):
                 stats.add(RESTORE_SKIPPED)
             else:
                 # Candidate. Stop in front of it if it cannot be selected.
@@ -724,7 +736,7 @@ class SimpleCPUOffloadScheduler:
                 gpu_ids.append(node.block_id)
                 block_hashes.append(bhash)
                 self._lazy_inflight_hashes.add(bhash)
-                self._gpu_offloaded[node.block_id] = bhash
+                self._gpu_offloaded[node.block_id] = (bhash, node.alloc_generation)
                 num_visited += 1
                 node = node.next_free_block
                 continue

@@ -70,9 +70,9 @@ def test_parse_options_defaults_and_production_config() -> None:
 @pytest.mark.parametrize(
     "extra_config",
     [
-        {"lazy_offload": "false"},
-        {"lazy_offload": 1},
-        {"allow_restore": "true"},
+        {"lazy_offload": "yes"},
+        {"lazy_offload": 2},
+        {"allow_restore": None},
         {"cpu_bytes_to_use": True},
         {"cpu_bytes_to_use": 0},
         {"cpu_bytes_to_use": [1]},
@@ -87,6 +87,23 @@ def test_parse_options_defaults_and_production_config() -> None:
 def test_parse_options_rejects(extra_config: dict) -> None:
     with pytest.raises(ValueError):
         parse_options(extra_config)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("True", True),
+        (" false ", False),
+    ],
+)
+def test_parse_options_boolean_spellings(value, expected) -> None:
+    # bool("false") would be True; only unambiguous spellings are accepted.
+    assert parse_options({"lazy_offload": value}).lazy_offload is expected
+    assert parse_options({"allow_restore": value}).allow_restore is expected
 
 
 def test_test_switches_need_test_mode(monkeypatch) -> None:

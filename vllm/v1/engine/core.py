@@ -105,8 +105,11 @@ def _check_simple_cpu_offload_host_mem(vllm_config: VllmConfig) -> None:
     ):
         return
     options = parse_options(kv_transfer_config.kv_connector_extra_config)
+    parallel_config = vllm_config.parallel_config
+    # Each rank pins its share on its own node; workers re-check per rank.
+    local_ranks = parallel_config.local_world_size
     check_host_mem_before_pinning(
-        options.cpu_bytes_total(vllm_config.parallel_config.world_size),
+        options.cpu_bytes_per_rank(parallel_config.world_size) * local_ranks,
         options.min_host_mem_available_gib,
         "EngineCore",
     )
@@ -893,9 +896,25 @@ class EngineCore:
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
         if clear_cache:
+            if mode == "abort":
+                self._drain_connector_push_work()
             self._reset_caches()
 
         return None
+
+    def _drain_connector_push_work(self, max_steps: int = 100_000) -> None:
+        """Step until the KV connector's background work (e.g. CPU offload
+        stores pinning GPU blocks) is done. The in-proc engine is not stepped
+        while paused, so a cache reset right after an abort would otherwise
+        find those blocks still pinned."""
+        connector = getattr(self.scheduler, "connector", None)
+        if connector is None:
+            return
+        for _ in range(max_steps):
+            if not connector.has_pending_push_work():
+                return
+            self.step_fn()
+        logger.warning("KV connector work still pending after %d steps", max_steps)
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""

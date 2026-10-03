@@ -351,12 +351,14 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.alloc_generation += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.alloc_generation += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret

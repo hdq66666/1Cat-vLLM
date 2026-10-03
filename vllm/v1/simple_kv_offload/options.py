@@ -61,9 +61,13 @@ class SimpleCPUOffloadOptions:
 def _as_bool(key: str, value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    # bool("false") is True; refuse anything that is not a real boolean.
+    # bool("false") is True: accept only unambiguous spellings.
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
     raise ValueError(
-        f"kv_connector_extra_config[{key!r}] must be a JSON boolean, got {value!r}"
+        f"kv_connector_extra_config[{key!r}] must be a boolean, got {value!r}"
     )
 
 

@@ -23,6 +23,7 @@ def _vllm_config(
     extra_config: dict | None = None,
     enable_prefix_caching: bool = True,
     world_size: int = 4,
+    local_world_size: int | None = None,
 ):
     kv_transfer_config = None
     if kv_connector is not None:
@@ -35,7 +36,11 @@ def _vllm_config(
         kv_transfer_config=kv_transfer_config,
         cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
         parallel_config=SimpleNamespace(
-            world_size=world_size, data_parallel_rank_local=0
+            world_size=world_size,
+            local_world_size=(
+                world_size if local_world_size is None else local_world_size
+            ),
+            data_parallel_rank_local=0,
         ),
     )
 
@@ -85,6 +90,18 @@ def test_counts_every_rank_of_a_per_rank_tier(mem_available) -> None:
     _check_simple_cpu_offload_host_mem(_vllm_config(extra_config=config))
 
 
+def test_charges_only_the_ranks_on_this_node(mem_available) -> None:
+    # PP2 x TP4 over two nodes, 64 GiB server-wide = 8 GiB per rank: this
+    # node pins 4 x 8 GiB, the other node checks its own share.
+    config = {"cpu_bytes_to_use": 64 * GiB, "min_host_mem_available_gib": 15}
+    vllm_config = _vllm_config(extra_config=config, world_size=8, local_world_size=4)
+    mem_available["bytes"] = 48 * GiB
+    _check_simple_cpu_offload_host_mem(vllm_config)
+    mem_available["bytes"] = 46 * GiB
+    with pytest.raises(ValueError):
+        _check_simple_cpu_offload_host_mem(vllm_config)
+
+
 def test_unknown_mem_available_is_not_fatal(mem_available) -> None:
     mem_available["bytes"] = None
     _check_simple_cpu_offload_host_mem(_vllm_config(extra_config=PROD_CONFIG))
@@ -109,7 +126,7 @@ def test_noop_without_a_pinned_tier(mem_available, vllm_config) -> None:
 def test_invalid_options_fail_before_pinning(mem_available) -> None:
     with pytest.raises(ValueError, match="lazy_offload"):
         _check_simple_cpu_offload_host_mem(
-            _vllm_config(extra_config={"lazy_offload": "false"})
+            _vllm_config(extra_config={"lazy_offload": "maybe"})
         )
     assert mem_available["reads"] == 0
 
