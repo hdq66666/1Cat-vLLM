@@ -106,6 +106,29 @@ def test_parse_options_boolean_spellings(value, expected) -> None:
     assert parse_options({"allow_restore": value}).allow_restore is expected
 
 
+def test_parse_cpu_hit_admission_options() -> None:
+    options = parse_options(
+        {"cpu_hit_admission_wait_s": 0, "cpu_hit_admission_margin_blocks": 3}
+    )
+    assert options.cpu_hit_admission_wait_s == 0.0
+    assert options.cpu_hit_admission_margin_blocks == 3
+    assert parse_options({}).cpu_hit_admission_wait_s == 10.0
+    assert parse_options({}).cpu_hit_admission_max_wait_s == 60.0
+    options = parse_options({"cpu_hit_admission_max_wait_s": 5})
+    assert options.cpu_hit_admission_max_wait_s == 5.0
+    assert parse_options({}).cpu_hit_admission_margin_blocks is None
+    assert (
+        parse_options(
+            {"cpu_hit_admission_margin_blocks": None}
+        ).cpu_hit_admission_margin_blocks
+        is None
+    )
+    with pytest.raises(ValueError, match="cpu_hit_admission_wait_s"):
+        parse_options({"cpu_hit_admission_wait_s": -1})
+    with pytest.raises(ValueError, match="cpu_hit_admission_margin_blocks"):
+        parse_options({"cpu_hit_admission_margin_blocks": -1})
+
+
 def test_test_switches_need_test_mode(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE", raising=False)
     check_test_switches()

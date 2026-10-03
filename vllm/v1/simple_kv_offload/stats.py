@@ -45,6 +45,11 @@ RESERVE_STOPS = "store_reserve_stops"
 LOAD_REQUESTS = "load_requests"
 LOAD_DST_RECENTLY_FREED = "load_dst_recently_freed_blocks"
 CPU_HITS_REFUSED = "cpu_hits_refused"
+# Steps in which a CPU hit was deferred for lack of GPU pool headroom, the
+# requests that gave up and prefilled from scratch, and the longest deferral.
+CPU_HITS_DEFERRED = "cpu_hit_deferred_steps"
+CPU_HITS_COLD_FALLBACK = "cpu_hit_cold_fallbacks"
+CPU_HIT_WAIT_S_MAX = "cpu_hit_wait_s_max"
 STORE_PINS_LAST = "store_pinned_gpu_blocks_last"
 CPU_USED_BLOCKS_LAST = "cpu_used_blocks_last"
 CPU_CACHED_BLOCKS_LAST = "cpu_cached_blocks_last"

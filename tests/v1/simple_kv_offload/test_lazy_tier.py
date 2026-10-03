@@ -681,7 +681,8 @@ def test_load_log_lines(monkeypatch) -> None:
     now[0] += 0.25
     simulate_load_completion(sched, {req2.request_id})
     assert lines == [
-        "SimpleCPU load req=req-log local_hit=16 cpu_hit=32 blocks=2 event=0",
+        "SimpleCPU load req=req-log local_hit=16 cpu_hit=32 blocks=2 event=0 "
+        "pool_free=- need_hit=- need_next=- margin=- need_cold=-",
         "SimpleCPU load done req=req-log event=0 steps=2 wall_ms=250.0",
     ]
 

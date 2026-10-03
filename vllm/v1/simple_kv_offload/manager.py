@@ -30,6 +30,9 @@ from vllm.v1.simple_kv_offload.metadata import (
 from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 from vllm.v1.simple_kv_offload.stats import (
     CPU_CACHED_BLOCKS_LAST,
+    CPU_HIT_WAIT_S_MAX,
+    CPU_HITS_COLD_FALLBACK,
+    CPU_HITS_DEFERRED,
     CPU_HITS_REFUSED,
     CPU_USED_BLOCKS_LAST,
     HOST_MEM_AVAILABLE_GIB_MIN,
@@ -44,7 +47,7 @@ from vllm.v1.simple_kv_offload.stats import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -80,6 +83,11 @@ class LoadRequestState:
     num_cpu_hit_tokens: int = 0
     emit_step: int = 0
     emit_time: float = 0.0
+    # GPU blocks the request's first compute step after the load takes;
+    # reserved against later CPU hit admissions while the load is in flight.
+    need_next: int = 0
+    # (free, need_hit, need_next, margin, need_cold) the admission check saw.
+    admission: tuple[int, int, int, int, int] | None = None
 
 
 @dataclass
@@ -91,6 +99,8 @@ class PendingCPUHit:
     num_tokens: int
     # GPU-local prefix hit the CPU hit continues from.
     num_local_tokens: int
+    need_next: int = 0
+    admission: tuple[int, int, int, int, int] | None = None
 
 
 # NOTE: This per-request state is only used in eager mode.
@@ -167,6 +177,10 @@ class SimpleCPUOffloadScheduler:
 
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
+        # The scheduler's KVCacheManager (bound with the pool): its allocator
+        # estimates what a CPU hit takes on the GPU. Without it CPU hits are
+        # admitted unconditionally.
+        self._gpu_kv_cache_manager: KVCacheManager | None = None
 
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
@@ -177,6 +191,21 @@ class SimpleCPUOffloadScheduler:
         # CPU hits found by get_num_new_matched_tokens(), kept pinned via
         # touch() while awaiting update_state_after_alloc().
         self._pending_cpu_hits: dict[str, PendingCPUHit] = {}
+        # CPU hit admission: request id -> time of its first deferral, and the
+        # requests that waited too long and are prefilled from scratch.
+        self._deferred_hits: dict[str, float] = {}
+        self._cold_fallback_req_ids: set[str] = set()
+        # Requests scheduled in the last step (the default admission margin).
+        self._num_running_last_step = 0
+        self._use_eagle = use_eagle
+        self._num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        self._max_model_len = vllm_config.model_config.max_model_len
+        scheduler_config = vllm_config.scheduler_config
+        self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        self._long_prefill_token_threshold = (
+            scheduler_config.long_prefill_token_threshold
+        )
+        self._reserve_full_isl = scheduler_config.scheduler_reserve_full_isl
 
         # Store metadata
         self._lazy_mode = lazy_offload
@@ -297,6 +326,10 @@ class SimpleCPUOffloadScheduler:
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
 
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        """Bind the scheduler's KVCacheManager; see _check_admission()."""
+        self._gpu_kv_cache_manager = kv_cache_manager
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -312,6 +345,9 @@ class SimpleCPUOffloadScheduler:
         # Requests that bypass the GPU prefix cache (e.g. prompt_logprobs)
         # must compute every prompt token: no CPU hit either.
         if request.skip_reading_prefix_cache:
+            return 0, False
+        # Waited too long for GPU pool headroom: prefilled from scratch.
+        if request.request_id in self._cold_fallback_req_ids:
             return 0, False
 
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
@@ -335,6 +371,13 @@ class SimpleCPUOffloadScheduler:
             if reason is not None:
                 self._refuse_cpu_hit(request.request_id, reason)
                 return 0, False
+            admission, admitted = self._check_admission(
+                request, hit_length, num_computed_tokens
+            )
+            if not admitted:
+                assert admission is not None
+                return self._defer_cpu_hit(request, hit_length, admission)
+            self._deferred_hits.pop(request.request_id, None)
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
@@ -343,6 +386,8 @@ class SimpleCPUOffloadScheduler:
                 blocks=cpu_hit_blocks,
                 num_tokens=hit_length,
                 num_local_tokens=num_computed_tokens,
+                need_next=admission[2] if admission is not None else 0,
+                admission=admission,
             )
             return hit_length, True
         return 0, False
@@ -402,6 +447,194 @@ class SimpleCPUOffloadScheduler:
         )
         self._num_refused_hits_unlogged = 0
         self._next_refused_hit_log = now + REFUSED_HIT_LOG_INTERVAL_S
+
+    def _check_admission(
+        self, request: "Request", hit_length: int, num_computed_tokens: int
+    ) -> tuple[tuple[int, int, int, int, int] | None, bool]:
+        """Whether the GPU pool can take the hit and what follows it.
+
+        A hit is allocated in one piece and the request is parked until the
+        load completes. If its first compute step after the load (the rest
+        of the prompt plus lookahead) cannot be allocated then, the request
+        waits holding every loaded block while the running requests, which
+        still need a block now and then, preempt each other: a restore near
+        the pool size ends up slower than a cold prefill. So a hit is admitted
+        only when the pool has room for the hit, for that first step and for a
+        margin covering the running requests' growth during the load; blocks
+        reserved by loads still in flight are not counted as free.
+
+        Returns ``(numbers, admitted)``: ``(free, need_hit, need_next,
+        margin, need_cold)`` as the check saw them (None without a bound
+        manager; need_cold is what a cold start of the request would take
+        now, by the scheduler's own admission gate), and whether the hit can
+        be admitted.
+        """
+        kv_cache_manager = self._gpu_kv_cache_manager
+        if kv_cache_manager is None:
+            return None, True
+        coordinator = kv_cache_manager.coordinator
+        req_id = request.request_id
+        max_model_len = self._max_model_len
+        total_computed = num_computed_tokens + hit_length
+
+        # The GPU prefix hit this CPU hit continues from, as allocate_slots()
+        # will see it. Looked up again because get_computed_blocks() also
+        # records prefix cache statistics.
+        local_blocks, local_len = coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if local_len != num_computed_tokens:
+            if self._test_mode:
+                raise AssertionError(
+                    f"SimpleCPUOffloadScheduler: req_id={req_id} GPU prefix hit "
+                    f"{local_len} != num_computed_tokens {num_computed_tokens}"
+                )
+            logger.debug(
+                "SimpleCPU admission: req=%s GPU prefix hit %d != %d, counting "
+                "the hit without it",
+                req_id,
+                local_len,
+                num_computed_tokens,
+            )
+            local_blocks = tuple([] for _ in coordinator.single_type_managers)
+
+        # The hit itself, exactly as allocate_slots() charges an async load:
+        # no new tokens, and no lookahead with an EAGLE/MTP drafter.
+        lookahead_hit = 0 if self._use_eagle else self._num_lookahead_tokens
+        num_tokens_hit = min(total_computed + lookahead_hit, max_model_len)
+        need_hit = coordinator.get_num_blocks_to_allocate(
+            request_id=req_id,
+            num_tokens=num_tokens_hit,
+            new_computed_blocks=local_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed,
+            num_tokens_main_model=total_computed,
+        )
+
+        # The first compute step after the load: the next prompt chunk (at
+        # least the last token on a full hit) plus the lookahead.
+        step_tokens = max(request.num_tokens - total_computed, 1)
+        step_tokens = min(step_tokens, self._max_num_batched_tokens)
+        if 0 < self._long_prefill_token_threshold < step_tokens:
+            step_tokens = self._long_prefill_token_threshold
+        num_tokens_next = min(
+            total_computed + step_tokens + self._num_lookahead_tokens, max_model_len
+        )
+        need_next = 0
+        for group in self.cpu_kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not spec.prefix_cacheable:
+                # Per-request scratch (e.g. the QSA ring): fixed, taken with
+                # the hit.
+                continue
+            if isinstance(spec, MambaSpec):
+                # Align mode: a request that already has blocks takes at most
+                # one more; the other modes cross at most one block boundary.
+                need_next += 1
+            else:
+                need_next += cdiv(num_tokens_next, spec.block_size) - cdiv(
+                    num_tokens_hit, spec.block_size
+                )
+
+        # What a cold start of the request takes now: the full sequence when
+        # the scheduler reserves it up front, else the first chunk.
+        if self._reserve_full_isl:
+            full = min(request.num_tokens, max_model_len)
+            need_cold = coordinator.get_num_blocks_to_allocate(
+                request_id=req_id,
+                num_tokens=full,
+                new_computed_blocks=local_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=num_computed_tokens,
+                num_tokens_main_model=full,
+                apply_admission_cap=True,
+            )
+        else:
+            chunk = min(
+                request.num_tokens - num_computed_tokens, self._max_num_batched_tokens
+            )
+            if 0 < self._long_prefill_token_threshold < chunk:
+                chunk = self._long_prefill_token_threshold
+            need_cold = coordinator.get_num_blocks_to_allocate(
+                request_id=req_id,
+                num_tokens=min(
+                    num_computed_tokens + chunk + self._num_lookahead_tokens,
+                    max_model_len,
+                ),
+                new_computed_blocks=local_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=num_computed_tokens,
+                num_tokens_main_model=num_computed_tokens + chunk,
+            )
+
+        margin = self.options.cpu_hit_admission_margin_blocks
+        if margin is None:
+            margin = self._num_running_last_step
+        reserved = sum(
+            state.need_next
+            for state in self._reqs_to_load.values()
+            if not state.finished
+        )
+        free = kv_cache_manager.block_pool.get_num_free_blocks() - reserved
+        numbers = (free, need_hit, need_next, margin, need_cold)
+        return numbers, free >= need_hit + need_next + margin
+
+    def _defer_cpu_hit(
+        self,
+        request: "Request",
+        hit_length: int,
+        shortfall: tuple[int, int, int, int, int],
+    ) -> tuple[int | None, bool]:
+        """Skip the request this step. After cpu_hit_admission_wait_s the hit
+        is given up as soon as a cold start would be admitted now (giving it
+        up earlier would gain nothing: the request could not start either
+        way), after cpu_hit_admission_max_wait_s regardless."""
+        req_id = request.request_id
+        now = self._clock()
+        since = self._deferred_hits.setdefault(req_id, now)
+        waited = now - since
+        free, need_hit, need_next, margin, need_cold = shortfall
+        self._stats.add(CPU_HITS_DEFERRED)
+        self._stats.add(CPU_HIT_WAIT_S_MAX, waited)
+        options = self.options
+        if waited >= options.cpu_hit_admission_max_wait_s or (
+            waited >= options.cpu_hit_admission_wait_s and free >= need_cold
+        ):
+            del self._deferred_hits[req_id]
+            self._cold_fallback_req_ids.add(req_id)
+            self._stats.add(CPU_HITS_COLD_FALLBACK)
+            logger.info(
+                "SimpleCPU hit req=%s cpu_hit=%d gives up after %.1fs and "
+                "prefills from scratch: GPU pool free=%d (loads in flight "
+                "excluded), hit needs %d, its next step %d, margin %d, a cold "
+                "start needs %d",
+                req_id,
+                hit_length,
+                waited,
+                free,
+                need_hit,
+                need_next,
+                margin,
+                need_cold,
+            )
+            return 0, False
+        if since == now:
+            logger.info(
+                "SimpleCPU hit req=%s cpu_hit=%d deferred: GPU pool free=%d "
+                "(loads in flight excluded), hit needs %d, its next step %d, "
+                "margin %d, a cold start needs %d; retrying for %.0fs, then "
+                "until a cold start fits, at most %.0fs",
+                req_id,
+                hit_length,
+                free,
+                need_hit,
+                need_next,
+                margin,
+                need_cold,
+                options.cpu_hit_admission_wait_s,
+                options.cpu_hit_admission_max_wait_s,
+            )
+        return None, False
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
     # general API should scan blocks in both GPU and CPU block pool in a single pass.
@@ -539,6 +772,8 @@ class SimpleCPUOffloadScheduler:
             transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids),
             num_local_hit_tokens=pending.num_local_tokens,
             num_cpu_hit_tokens=num_external_tokens,
+            need_next=pending.need_next,
+            admission=pending.admission,
         )
 
     def build_connector_meta(
@@ -546,6 +781,7 @@ class SimpleCPUOffloadScheduler:
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
         self._maybe_check_host_mem()
+        self._num_running_last_step = len(scheduler_output.num_scheduled_tokens)
 
         # --- Stores ---
         store_event = -1
@@ -586,13 +822,17 @@ class SimpleCPUOffloadScheduler:
                 load_state.load_event = load_event
                 load_state.emit_step = self._num_steps
                 load_state.emit_time = now
+                admission = load_state.admission
                 logger.info(
-                    "SimpleCPU load req=%s local_hit=%d cpu_hit=%d blocks=%d event=%d",
+                    "SimpleCPU load req=%s local_hit=%d cpu_hit=%d blocks=%d "
+                    "event=%d pool_free=%s need_hit=%s need_next=%s margin=%s "
+                    "need_cold=%s",
                     req_id,
                     load_state.num_local_hit_tokens,
                     load_state.num_cpu_hit_tokens,
                     len(load_state.transfer_meta.gpu_block_ids),
                     load_event,
+                    *(admission if admission is not None else ("-",) * 5),
                 )
             self._load_event_to_reqs[load_event] = load_req_ids
 
@@ -1017,6 +1257,8 @@ class SimpleCPUOffloadScheduler:
         for pending in self._pending_cpu_hits.values():
             self._free_pending_cpu_hit(pending)
         self._pending_cpu_hits.clear()
+        self._deferred_hits.clear()
+        self._cold_fallback_req_ids.clear()
         self._cursor = None
         self._gpu_offloaded.clear()
         self._lazy_inflight_hashes.clear()
@@ -1097,6 +1339,8 @@ class SimpleCPUOffloadScheduler:
         pending = self._pending_cpu_hits.pop(req_id, None)
         if pending is not None:
             self._free_pending_cpu_hit(pending)
+        self._deferred_hits.pop(req_id, None)
+        self._cold_fallback_req_ids.discard(req_id)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
