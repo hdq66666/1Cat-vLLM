@@ -409,7 +409,7 @@ def test_inflight_hash_dedup() -> None:
     assert _drain(fix) == []
 
 
-def test_walk_refreshes_cpu_lru_of_reused_blocks() -> None:
+def test_walk_does_not_refresh_cpu_recency() -> None:
     # 4 usable CPU blocks (the null block takes one).
     fix = _lazy(num_gpu_blocks=32, num_cpu_blocks=5)
     sched, gpu_pool = fix.scheduler, fix.gpu_block_pool
@@ -417,14 +417,73 @@ def test_walk_refreshes_cpu_lru_of_reused_blocks() -> None:
     _drain(fix)
     _, blocks_b = _finish(gpu_pool, 2)
     _drain(fix)
-    # A is reused on GPU; the walk passes it and refreshes its CPU copy.
+    # The walk passes A again without any request finishing on it: sitting
+    # in the GPU free queue is not use, so A stays the oldest CPU entry.
     _reuse(fix, blocks_a)
     assert _drain(fix) == []
     _, blocks_c = _finish(gpu_pool, 2)
     _drain(fix)
 
+    assert not any(_on_cpu(sched, b) for b in blocks_a)
+    assert all(_on_cpu(sched, b) for b in blocks_b + blocks_c)
+
+
+def test_finished_request_refreshes_cpu_recency_head_last() -> None:
+    fix = _lazy(num_gpu_blocks=32, num_cpu_blocks=5)
+    sched, gpu_pool = fix.scheduler, fix.gpu_block_pool
+    req_a, blocks_a = _finish(gpu_pool, 2)
+    _drain(fix)
+    _, blocks_b = _finish(gpu_pool, 2)
+    _drain(fix)
+    # A request that used A's prefix finishes (before its GPU blocks are
+    # freed, as the scheduler does): A's CPU copies become the most recent,
+    # prefix head last.
+    gpu_pool.touch(blocks_a)
+    sched.request_finished_all_groups(
+        _clone(req_a, "reuse-a"), ([b.block_id for b in blocks_a],)
+    )
+    gpu_pool.free_blocks(reversed(blocks_a))
+    cpu_lru = [b.block_hash for b in _free_queue(sched.cpu_block_pool)]
+    assert cpu_lru[-2:] == [blocks_a[1].block_hash, blocks_a[0].block_hash]
+
+    _, blocks_c = _finish(gpu_pool, 2)
+    _drain(fix)
     assert all(_on_cpu(sched, b) for b in blocks_a + blocks_c)
     assert not any(_on_cpu(sched, b) for b in blocks_b)
+
+
+def test_restored_conversation_outlives_untouched_fillers() -> None:
+    """A conversation restored from CPU and used again survives the next
+    burst of other traffic; the fillers that merely sat in the GPU free
+    queue are evicted first (production needle run, small scale)."""
+    # 6 usable CPU blocks.
+    fix = _lazy(num_gpu_blocks=32, num_cpu_blocks=7)
+    sched, gpu_pool = fix.scheduler, fix.gpu_block_pool
+    req_a, blocks_a = _finish(gpu_pool, 2)
+    _drain(fix)
+    _, fillers0 = _finish(gpu_pool, 4)
+    _drain(fix)
+
+    # A's GPU copies are evicted; a resend restores A from CPU and finishes.
+    gpu_pool.evict_blocks({b.block_id for b in blocks_a})
+    resend = _clone(req_a, "resend-a")
+    hit, is_async = sched.get_num_new_matched_tokens(resend, 0)
+    assert (hit, is_async) == (2 * BLOCK_SIZE, True)
+    dst = gpu_pool.get_new_blocks(2)
+    sched.update_state_after_alloc(resend, KVCacheBlocks(blocks=(dst,)), hit)
+    sched.build_connector_meta(_busy())
+    simulate_load_completion(sched, {resend.request_id})
+    gpu_pool.cache_full_blocks(resend, dst, 0, 2, BLOCK_SIZE, 0)
+    sched.request_finished_all_groups(resend, ([b.block_id for b in dst],))
+    gpu_pool.free_blocks(reversed(dst))
+
+    # The walk passes the fillers' GPU copies (no use), then new traffic
+    # fills the CPU tier again.
+    _drain(fix)
+    _finish(gpu_pool, 4)
+    _drain(fix)
+    assert all(_on_cpu(sched, b) for b in dst), "restored conversation evicted"
+    assert not any(_on_cpu(sched, b) for b in fillers0)
 
 
 def test_load_destinations_are_not_stored_back() -> None:
