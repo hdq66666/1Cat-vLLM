@@ -780,6 +780,7 @@ if TYPE_CHECKING:
     VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES: int = 0
     VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES: int = 0
     VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT: bool = False
+    VLLM_MRV2_CLEAR_BLOCK_TABLE_TAILS: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
@@ -4976,6 +4977,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT": lambda: bool(
         int(os.getenv("VLLM_QSA_PRE_INDEXER_DEBUG_ASSERT", "0"))
     ),
+    # Diagnostic (2026-10-10): zero the unused tail of every block-table row
+    # (source rows on overwrite, gathered input rows past num_blocks) so a
+    # kernel that reads past a request's blocks sees the null block instead
+    # of another request's block id.
+    "VLLM_MRV2_CLEAR_BLOCK_TABLE_TAILS": lambda: bool(
+        int(os.getenv("VLLM_MRV2_CLEAR_BLOCK_TABLE_TAILS", "0"))
+    ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -5148,6 +5156,7 @@ def compile_factors() -> dict[str, object]:
         "NO_COLOR",
         # SimpleCPUOffload diagnostics; none of them changes a compiled graph.
         "VLLM_SIMPLE_KV_OFFLOAD_VERIFY",
+        "VLLM_MRV2_CLEAR_BLOCK_TABLE_TAILS",
         "VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE",
         "VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD",
         "VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO",

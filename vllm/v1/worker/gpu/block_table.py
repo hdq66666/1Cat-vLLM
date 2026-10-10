@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
@@ -39,6 +40,7 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        self.clear_tails = envs.VLLM_MRV2_CLEAR_BLOCK_TABLE_TAILS
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -113,6 +115,16 @@ class BlockTables:
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+            if overwrite and self.clear_tails:
+                # The row's previous occupant left its block ids past the new
+                # length; blank them so nothing can read them as live blocks.
+                # One staged write per row: the staging buffers hold at most
+                # max_num_reqs entries.
+                row_len = self.block_tables[i].gpu.shape[1]
+                self.num_blocks.np[i, req_index] = len(block_ids)
+                block_ids = list(block_ids) + [0] * (row_len - len(block_ids))
+                self.block_tables[i].stage_write(req_index, 0, block_ids)
+                continue
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
@@ -139,6 +151,7 @@ class BlockTables:
             self.num_blocks.gpu.stride(0),
             num_reqs,
             BLOCK_SIZE=1024,  # type: ignore
+            CLEAR_TAILS=self.clear_tails,  # type: ignore
         )
         return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
 
@@ -199,6 +212,7 @@ def _gather_block_tables_kernel(
     num_blocks_stride,
     num_reqs,  # actual number of requests (for padding)
     BLOCK_SIZE: tl.constexpr,
+    CLEAR_TAILS: tl.constexpr,
 ):
     # kv cache group id
     group_id = tl.program_id(0)
@@ -227,6 +241,11 @@ def _gather_block_tables_kernel(
         offset = i + tl.arange(0, BLOCK_SIZE)
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
+    if CLEAR_TAILS:
+        # The row keeps the previous step's ids past num_blocks otherwise.
+        for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
+            offset = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
 
 
 @triton.jit
