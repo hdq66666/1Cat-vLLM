@@ -63,6 +63,11 @@ class SimpleCPUOffloadOptions:
     # log the GPU/CPU block ids of every store and load event.
     freed_block_quarantine_steps: int = 0
     log_transfer_blocks: bool = False
+    # probe_block: fingerprint this GPU block (e.g. 0, the null block that no
+    # request owns) at the end of every step on the compute stream, without
+    # host synchronization, and log a warning whenever its content changes:
+    # a change means some kernel writes through a block id it does not own.
+    probe_block: int | None = None
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -147,6 +152,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         "store_reserve_free_blocks",
         "cpu_hit_admission_margin_blocks",
         "freed_block_quarantine_steps",
+        "probe_block",
     ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)

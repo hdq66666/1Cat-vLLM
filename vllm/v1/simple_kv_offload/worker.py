@@ -148,6 +148,17 @@ class SimpleCPUOffloadWorker:
         self._compute_delay_cycles = int(
             test_switch("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES")
         )
+        # Diagnostic block probe (options.probe_block): per-region byte sums of
+        # one block, taken on the compute stream at the end of every step and
+        # read back one step later through a pinned ring, so a foreign write
+        # into that block is reported without host synchronization.
+        self._probe_step = 0
+        self._probe_names: list[str] = []
+        self._probe_pinned: list[torch.Tensor] = []
+        self._probe_events: list[torch.cuda.Event | None] = []
+        self._probe_steps: list[int] = []
+        self._probe_last: torch.Tensor | None = None
+        self._probe_disabled = False
 
     def register_kv_caches(
         self,
@@ -386,6 +397,8 @@ class SimpleCPUOffloadWorker:
                     event_idx=metadata.store_event,
                 )
 
+        self._run_block_probe(metadata)
+
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
 
@@ -411,6 +424,69 @@ class SimpleCPUOffloadWorker:
         self._check_transfer_timeouts()
 
         return None, finished_recving or None
+
+    def _run_block_probe(self, metadata: SimpleCPUOffloadMetadata | None) -> None:
+        """See options.probe_block. Runs after this step's transfers were
+        submitted; the fingerprint is taken on the compute stream, i.e. it
+        reflects the block after this step's forward pass."""
+        block_id = self.options.probe_block
+        if block_id is None or self._probe_disabled or self.gpu_kv_caches is None:
+            return
+        try:
+            self._probe_step += 1
+            step = self._probe_step
+            if not self._probe_names:
+                self._probe_names = list(self.gpu_kv_caches)
+                for _ in range(4):
+                    self._probe_pinned.append(
+                        torch.zeros(
+                            len(self._probe_names), dtype=torch.int64
+                        ).pin_memory()
+                    )
+                    self._probe_events.append(None)
+                    self._probe_steps.append(0)
+            slot = step % 4
+            # Read back the fingerprint taken 4 steps ago (its event is done
+            # by now; if not, skip it rather than wait).
+            prev_event = self._probe_events[slot]
+            if prev_event is not None and prev_event.query():
+                current = self._probe_pinned[slot].clone()
+                if self._probe_last is not None and not torch.equal(
+                    current, self._probe_last
+                ):
+                    changed = [
+                        f"{name}:{int(a)}->{int(b)}"
+                        for name, a, b in zip(
+                            self._probe_names, self._probe_last, current
+                        )
+                        if a != b
+                    ]
+                    logger.warning(
+                        "SimpleCPUOffload block probe: GPU block %d changed at "
+                        "probe step %d (rank %d): %s",
+                        block_id,
+                        self._probe_steps[slot],
+                        _global_rank(),
+                        ", ".join(changed[:8]),
+                    )
+                self._probe_last = current
+            sums = torch.stack(
+                [
+                    region[block_id]
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .sum(dtype=torch.int64)
+                    for region in self.gpu_kv_caches.values()
+                ]
+            )
+            self._probe_pinned[slot].copy_(sums, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            self._probe_events[slot] = event
+            self._probe_steps[slot] = step
+        except Exception:
+            logger.exception("SimpleCPUOffload block probe disabled after an error")
+            self._probe_disabled = True
 
     def _order_load_behind_compute(self) -> None:
         """Order the next load behind everything queued on the compute stream."""
