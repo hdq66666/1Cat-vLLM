@@ -398,6 +398,10 @@ class SimpleCPUOffloadWorker:
                 )
 
         self._run_block_probe(metadata)
+        if self.options.debug_gpu_sleep_cycles > 0:
+            torch.cuda._sleep(self.options.debug_gpu_sleep_cycles)
+        if self.options.debug_host_sleep_ms > 0:
+            time.sleep(self.options.debug_host_sleep_ms / 1000.0)
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
