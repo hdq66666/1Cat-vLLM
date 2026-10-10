@@ -68,6 +68,14 @@ class SimpleCPUOffloadOptions:
     # host synchronization, and log a warning whenever its content changes:
     # a change means some kernel writes through a block id it does not own.
     probe_block: int | None = None
+    # debug_host_sleep_ms / debug_gpu_sleep_cycles: after this step's
+    # transfers were submitted, sleep on the host for that many milliseconds
+    # or queue a spin of that many cycles on the compute stream. Timing
+    # experiments only: they tell a host-side race (the host overruns a buffer
+    # the GPU still reads) from a stream-ordering race (later GPU work races
+    # a transfer).
+    debug_host_sleep_ms: float = 0.0
+    debug_gpu_sleep_cycles: int = 0
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -153,6 +161,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         "cpu_hit_admission_margin_blocks",
         "freed_block_quarantine_steps",
         "probe_block",
+        "debug_gpu_sleep_cycles",
     ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)
@@ -162,6 +171,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         ("transfer_timeout_s", 1.0),
         ("cpu_hit_admission_wait_s", 0.0),
         ("cpu_hit_admission_max_wait_s", 0.0),
+        ("debug_host_sleep_ms", 0.0),
     ):
         if key in cfg:
             kwargs[key] = _as_float(key, cfg[key], minimum)

@@ -128,6 +128,13 @@ def test_parse_cpu_hit_admission_options() -> None:
     )
     assert diag.freed_block_quarantine_steps == 4 and diag.log_transfer_blocks
     assert parse_options({}).freed_block_quarantine_steps == 0
+    timing = parse_options(
+        {"debug_host_sleep_ms": 1.5, "debug_gpu_sleep_cycles": 2000000}
+    )
+    assert timing.debug_host_sleep_ms == 1.5
+    assert timing.debug_gpu_sleep_cycles == 2000000
+    assert parse_options({}).debug_host_sleep_ms == 0.0
+    assert parse_options({}).debug_gpu_sleep_cycles == 0
     with pytest.raises(ValueError, match="cpu_hit_admission_wait_s"):
         parse_options({"cpu_hit_admission_wait_s": -1})
     with pytest.raises(ValueError, match="cpu_hit_admission_margin_blocks"):
