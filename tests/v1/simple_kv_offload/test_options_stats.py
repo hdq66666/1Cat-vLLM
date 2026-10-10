@@ -135,6 +135,10 @@ def test_parse_cpu_hit_admission_options() -> None:
     assert timing.debug_gpu_sleep_cycles == 2000000
     assert parse_options({}).debug_host_sleep_ms == 0.0
     assert parse_options({}).debug_gpu_sleep_cycles == 0
+    assert parse_options({}).probe_every == 1
+    assert parse_options({"probe_every": 100}).probe_every == 100
+    with pytest.raises(ValueError, match="probe_every"):
+        parse_options({"probe_every": 0})
     with pytest.raises(ValueError, match="cpu_hit_admission_wait_s"):
         parse_options({"cpu_hit_admission_wait_s": -1})
     with pytest.raises(ValueError, match="cpu_hit_admission_margin_blocks"):

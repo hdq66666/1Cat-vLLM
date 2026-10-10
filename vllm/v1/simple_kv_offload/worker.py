@@ -153,6 +153,7 @@ class SimpleCPUOffloadWorker:
         # read back one step later through a pinned ring, so a foreign write
         # into that block is reported without host synchronization.
         self._probe_step = 0
+        self._probe_calls = 0
         self._probe_names: list[str] = []
         self._probe_pinned: list[torch.Tensor] = []
         self._probe_events: list[torch.cuda.Event | None] = []
@@ -435,6 +436,9 @@ class SimpleCPUOffloadWorker:
         reflects the block after this step's forward pass."""
         block_id = self.options.probe_block
         if block_id is None or self._probe_disabled or self.gpu_kv_caches is None:
+            return
+        self._probe_calls += 1
+        if (self._probe_calls - 1) % max(1, self.options.probe_every) != 0:
             return
         try:
             self._probe_step += 1
