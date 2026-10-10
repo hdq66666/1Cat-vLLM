@@ -123,6 +123,11 @@ def test_parse_cpu_hit_admission_options() -> None:
         ).cpu_hit_admission_margin_blocks
         is None
     )
+    diag = parse_options(
+        {"freed_block_quarantine_steps": 4, "log_transfer_blocks": True}
+    )
+    assert diag.freed_block_quarantine_steps == 4 and diag.log_transfer_blocks
+    assert parse_options({}).freed_block_quarantine_steps == 0
     with pytest.raises(ValueError, match="cpu_hit_admission_wait_s"):
         parse_options({"cpu_hit_admission_wait_s": -1})
     with pytest.raises(ValueError, match="cpu_hit_admission_margin_blocks"):
@@ -209,6 +214,19 @@ def test_stats_aggregate_over_ranks_and_reduce() -> None:
     assert "store_events" not in reduced
     assert reduced[kv_stats.HOST_MEM_AVAILABLE_GIB_MIN] == 17.0
     assert reduced[kv_stats.CPU_USED_BLOCKS_LAST] == 3
+
+
+def test_reduce_passes_every_counter_through() -> None:
+    stats = SimpleCPUOffloadStats()
+    stats.add(kv_stats.CPU_HITS_DEFERRED, 3)
+    stats.add(kv_stats.CPU_HIT_WAIT_S_MAX, 1.234)
+    stats.add(kv_stats.LOAD_DST_YOUNG, 5)
+    stats.add(kv_stats.LOAD_BYTES, 10)  # a raw input of a derived value
+    out = stats.reduce()
+    assert out[kv_stats.CPU_HITS_DEFERRED] == 3
+    assert out[kv_stats.CPU_HIT_WAIT_S_MAX] == 1.23
+    assert out[kv_stats.LOAD_DST_YOUNG] == 5
+    assert kv_stats.LOAD_BYTES not in out
 
 
 def test_build_kv_connector_stats_round_trip() -> None:
