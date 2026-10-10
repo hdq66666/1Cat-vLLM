@@ -56,6 +56,13 @@ class SimpleCPUOffloadOptions:
     # would do); after cpu_hit_admission_max_wait_s it is given up regardless.
     cpu_hit_admission_wait_s: float = 10.0
     cpu_hit_admission_max_wait_s: float = 60.0
+    # Diagnostics. freed_block_quarantine_steps > 0: GPU blocks freed within
+    # that many scheduler steps are neither selected for store nor (while
+    # older free blocks exist) handed out by the allocator, so a load never
+    # lands in a page a still-running step may touch. log_transfer_blocks:
+    # log the GPU/CPU block ids of every store and load event.
+    freed_block_quarantine_steps: int = 0
+    log_transfer_blocks: bool = False
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -121,7 +128,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["cpu_bytes_to_use_per_rank"] = _as_int(
             "cpu_bytes_to_use_per_rank", cfg["cpu_bytes_to_use_per_rank"], 1
         )
-    for key in ("lazy_offload", "allow_restore"):
+    for key in ("lazy_offload", "allow_restore", "log_transfer_blocks"):
         if key in cfg:
             kwargs[key] = _as_bool(key, cfg[key])
     if "copy_backend" in cfg:
@@ -136,7 +143,11 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["max_store_blocks_per_step"] = _as_int(
             "max_store_blocks_per_step", cfg["max_store_blocks_per_step"], 1
         )
-    for key in ("store_reserve_free_blocks", "cpu_hit_admission_margin_blocks"):
+    for key in (
+        "store_reserve_free_blocks",
+        "cpu_hit_admission_margin_blocks",
+        "freed_block_quarantine_steps",
+    ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)
     for key, minimum in (

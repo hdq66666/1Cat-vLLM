@@ -45,6 +45,12 @@ RESERVE_STOPS = "store_reserve_stops"
 LOAD_REQUESTS = "load_requests"
 LOAD_DST_RECENTLY_FREED = "load_dst_recently_freed_blocks"
 CPU_HITS_REFUSED = "cpu_hits_refused"
+# Load destinations freed (by any path) within RECENTLY_FREED_STEPS steps,
+# blocks the lazy walk skipped under freed_block_quarantine_steps, and the
+# allocations the quarantine could not honour.
+LOAD_DST_YOUNG = "load_dst_young_blocks"
+QUARANTINE_SKIPPED = "store_quarantine_skipped_blocks"
+QUARANTINE_FALLBACKS_LAST = "alloc_quarantine_fallback_blocks_last"
 # Steps in which a CPU hit was deferred for lack of GPU pool headroom, the
 # requests that gave up and prefilled from scratch, and the longest deferral.
 CPU_HITS_DEFERRED = "cpu_hit_deferred_steps"
@@ -54,6 +60,28 @@ STORE_PINS_LAST = "store_pinned_gpu_blocks_last"
 CPU_USED_BLOCKS_LAST = "cpu_used_blocks_last"
 CPU_CACHED_BLOCKS_LAST = "cpu_cached_blocks_last"
 HOST_MEM_AVAILABLE_GIB_MIN = "host_mem_available_gib_min"
+
+
+# Raw keys that reduce() folds into derived values.
+_REDUCED_INPUTS = frozenset(
+    {
+        LOAD_EVENTS,
+        LOAD_BLOCKS,
+        LOAD_BYTES,
+        LOAD_DMA_MS_SUM,
+        LOAD_DMA_MS_MAX,
+        LOAD_READY_MS_SUM,
+        LOAD_READY_MS_MAX,
+        STORE_EVENTS,
+        STORE_BLOCKS,
+        STORE_BYTES,
+        STORE_DMA_MS_SUM,
+        STORE_DMA_MS_MAX,
+        STORE_READY_MS_SUM,
+        STORE_READY_MS_MAX,
+        HOST_MEM_AVAILABLE_GIB_MIN,
+    }
+)
 
 
 def _merge(key: str, a: float, b: float) -> float:
@@ -141,6 +169,12 @@ class SimpleCPUOffloadStats(KVConnectorStats):
                 out[key] = int(d[key])
         if HOST_MEM_AVAILABLE_GIB_MIN in d:
             out[HOST_MEM_AVAILABLE_GIB_MIN] = round(d[HOST_MEM_AVAILABLE_GIB_MIN], 2)
+        # Every other counter or gauge (admission guard, diagnostics) as is,
+        # so a new key never has to be registered here to reach the log.
+        for key, value in d.items():
+            if key in out or key in _REDUCED_INPUTS:
+                continue
+            out[key] = round(value, 2) if isinstance(value, float) else int(value)
         return out
 
     def is_empty(self) -> bool:

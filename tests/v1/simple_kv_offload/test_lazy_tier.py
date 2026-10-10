@@ -203,6 +203,28 @@ def test_idle_drain_stores_every_hashed_block_then_stops() -> None:
         assert not sched.has_pending_work()
 
 
+def test_quarantine_skips_recently_freed_blocks() -> None:
+    fix = _lazy(num_gpu_blocks=64, num_cpu_blocks=64, freed_block_quarantine_steps=3)
+    sched, gpu_pool = fix.scheduler, fix.gpu_block_pool
+    assert gpu_pool.quarantine_steps == 3
+    # Four busy steps so the walk's step counter is past the quarantine.
+    for _ in range(4):
+        sched.build_connector_meta(_busy())
+    _, blocks = _finish(gpu_pool, 4)  # freed at the current step
+    assert all(b.freed_at_step == gpu_pool.current_step for b in blocks)
+
+    # Within the quarantine nothing is selected (and the engine is kept
+    # stepping so the blocks age); afterwards everything is.
+    for _ in range(2):
+        meta = sched.build_connector_meta(_busy())
+        assert meta.store_event < 0
+        assert sched.has_pending_work()
+    stats = sched.get_stats()
+    assert stats is not None and stats.data[kv_stats.QUARANTINE_SKIPPED] == 2
+    meta = sched.build_connector_meta(_busy())
+    assert sorted(meta.store_gpu_blocks) == sorted(b.block_id for b in blocks)
+
+
 def test_idle_drain_ends_when_reserve_blocks_every_store() -> None:
     # 15 usable GPU blocks, all free: the reserve never lets a store pin one.
     fix = _lazy(num_gpu_blocks=16, store_reserve_free_blocks=15)
@@ -649,6 +671,9 @@ def test_scheduler_stats_round_trip(monkeypatch) -> None:
     assert stats is not None
     assert stats.data == {
         kv_stats.LOAD_REQUESTS: 1,
+        # The load destinations were freed (by the finished request) within
+        # the last two steps.
+        kv_stats.LOAD_DST_YOUNG: 3,
         kv_stats.STORE_PINS_LAST: 0,
         kv_stats.CPU_USED_BLOCKS_LAST: 4,  # the null block + 3 load sources
         kv_stats.CPU_CACHED_BLOCKS_LAST: 3,

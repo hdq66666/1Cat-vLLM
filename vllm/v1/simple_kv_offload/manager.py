@@ -38,7 +38,10 @@ from vllm.v1.simple_kv_offload.stats import (
     HOST_MEM_AVAILABLE_GIB_MIN,
     INFLIGHT_SKIPPED,
     LOAD_DST_RECENTLY_FREED,
+    LOAD_DST_YOUNG,
     LOAD_REQUESTS,
+    QUARANTINE_FALLBACKS_LAST,
+    QUARANTINE_SKIPPED,
     RESERVE_STOPS,
     RESTORE_SKIPPED,
     STORE_PINS_LAST,
@@ -64,6 +67,17 @@ REFUSED_HIT_LOG_INTERVAL_S = 60.0
 # A load destination freed by a request that finished within this many
 # scheduler steps counts as LOAD_DST_RECENTLY_FREED.
 RECENTLY_FREED_STEPS = 2
+
+
+def _ranges(ids: list[int]) -> str:
+    """Compact "a-b,c,d-e" rendering of a block id list (log lines)."""
+    out: list[list[int]] = []
+    for i in sorted(ids):
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return ",".join(f"{a}-{b}" if a != b else str(a) for a, b in out)
 
 
 @dataclass
@@ -325,6 +339,7 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        gpu_block_pool.quarantine_steps = self.options.freed_block_quarantine_steps
 
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
         """Bind the scheduler's KVCacheManager; see _check_admission()."""
@@ -765,6 +780,22 @@ class SimpleCPUOffloadScheduler:
             )
             if num_recently_freed:
                 self._stats.add(LOAD_DST_RECENTLY_FREED, num_recently_freed)
+        # Same count from the pool's free stamps: covers preemption and
+        # skipped-block frees too.
+        oldest = self._num_steps - RECENTLY_FREED_STEPS
+        num_young = sum(
+            gpu_blocks[bid].freed_at_step >= oldest for bid in gpu_block_ids
+        )
+        if num_young:
+            self._stats.add(LOAD_DST_YOUNG, num_young)
+        if self.options.log_transfer_blocks:
+            logger.info(
+                "SimpleCPU load blocks req=%s step=%d gpu=%s cpu=%s",
+                req_id,
+                self._num_steps,
+                _ranges(gpu_block_ids),
+                _ranges(cpu_block_ids),
+            )
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
@@ -782,6 +813,8 @@ class SimpleCPUOffloadScheduler:
     ) -> SimpleCPUOffloadMetadata:
         self._maybe_check_host_mem()
         self._num_running_last_step = len(scheduler_output.num_scheduled_tokens)
+        if self._gpu_block_pool is not None:
+            self._gpu_block_pool.current_step = self._num_steps
 
         # --- Stores ---
         store_event = -1
@@ -789,6 +822,13 @@ class SimpleCPUOffloadScheduler:
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
+            if self.options.log_transfer_blocks:
+                logger.info(
+                    "SimpleCPU store blocks event=%d step=%d pairs=%s",
+                    store_event,
+                    self._num_steps,
+                    list(zip(store_gpu, store_cpu)),
+                )
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu, store_cpu
             )
@@ -922,6 +962,7 @@ class SimpleCPUOffloadScheduler:
             4 * max_per_step - self._num_store_pinned_blocks,
         )
         num_gpu_free = gpu_pool.get_num_free_blocks()
+        quarantine_steps = self.options.freed_block_quarantine_steps
         # Re-storing a block whose CPU copy was evicted is opt-in, and never
         # done on idle steps so the idle drain always ends.
         skip_restore = not self.options.allow_restore or is_idle
@@ -947,6 +988,7 @@ class SimpleCPUOffloadScheduler:
         block_hashes: list[BlockHashWithGroupId] = []
         num_visited = 0
         blocked = False
+        quarantined = False
         while node is not None and node is not tail and num_visited < visit_budget:
             bhash = node.block_hash
             if bhash is None or node.is_null:
@@ -965,6 +1007,17 @@ class SimpleCPUOffloadScheduler:
                 stats.add(RESTORE_SKIPPED)
             else:
                 # Candidate. Stop in front of it if it cannot be selected.
+                if (
+                    quarantine_steps > 0
+                    and node.freed_at_step > self._num_steps - quarantine_steps
+                ):
+                    # Freed too recently: a step that was in flight when it
+                    # was freed may still touch it. The cursor stays in front
+                    # of it and the engine keeps stepping until it has aged.
+                    stats.add(QUARANTINE_SKIPPED)
+                    quarantined = True
+                    blocked = True
+                    break
                 if len(gpu_ids) >= max_select:
                     blocked = True
                     break
@@ -991,7 +1044,9 @@ class SimpleCPUOffloadScheduler:
         elif blocked:
             # Progress next step needs this step's stores or earlier ones to
             # complete; with neither in flight nothing would change.
-            self._lazy_backlog = bool(gpu_ids) or bool(self._store_event_to_blocks)
+            self._lazy_backlog = (
+                quarantined or bool(gpu_ids) or bool(self._store_event_to_blocks)
+            )
         else:
             # Visit budget exhausted.
             self._lazy_backlog = True
@@ -1269,6 +1324,13 @@ class SimpleCPUOffloadScheduler:
         """Scheduler-side counters since the last call plus current gauges."""
         stats = self._stats
         stats.add(STORE_PINS_LAST, self._num_store_pinned_blocks)
+        if (
+            self._gpu_block_pool is not None
+            and self.options.freed_block_quarantine_steps
+        ):
+            stats.add(
+                QUARANTINE_FALLBACKS_LAST, self._gpu_block_pool.quarantine_fallbacks
+            )
         stats.add(
             CPU_USED_BLOCKS_LAST,
             self.num_cpu_blocks - self.cpu_block_pool.get_num_free_blocks(),
