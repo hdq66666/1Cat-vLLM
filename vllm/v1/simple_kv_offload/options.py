@@ -68,6 +68,9 @@ class SimpleCPUOffloadOptions:
     # host synchronization, and log a warning whenever its content changes:
     # a change means some kernel writes through a block id it does not own.
     probe_block: int | None = None
+    # probe_every: take the probe_block fingerprint only every that many
+    # steps (1 = every step). A sparse probe barely perturbs the step timing.
+    probe_every: int = 1
     # debug_host_sleep_ms / debug_gpu_sleep_cycles: after this step's
     # transfers were submitted, sleep on the host for that many milliseconds
     # or queue a spin of that many cycles on the compute stream. Timing
@@ -165,6 +168,8 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
     ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)
+    if cfg.get("probe_every") is not None:
+        kwargs["probe_every"] = _as_int("probe_every", cfg["probe_every"], 1)
     for key, minimum in (
         ("min_host_mem_available_gib", 0.0),
         ("host_mem_warn_gib", 0.0),
