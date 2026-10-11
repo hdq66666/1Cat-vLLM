@@ -95,7 +95,7 @@ def _make_kv_cache_config() -> KVCacheConfig:
     )
 
 
-def _make_scheduler() -> Scheduler:
+def _make_scheduler(extra: dict | None = None) -> Scheduler:
     kv_cache_config = _make_kv_cache_config()
     gpu_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
     vllm_config = VllmConfig(
@@ -129,6 +129,7 @@ def _make_scheduler() -> Scheduler:
                 "store_reserve_free_blocks": 0,
                 "max_store_blocks_per_step": NUM_GPU_BLOCKS,
                 "min_host_mem_available_gib": 0,
+                **(extra or {}),
             },
         ),
         device_config=DeviceConfig("cpu"),
@@ -147,11 +148,16 @@ def _make_scheduler() -> Scheduler:
     )
 
 
-def _make_request(request_id: str, prompt_token_ids: list[int]) -> Request:
+def _make_request(
+    request_id: str, prompt_token_ids: list[int], directives: dict | None = None
+) -> Request:
+    extra_args = (
+        {"kv_transfer_params": {"simple_cpu": directives}} if directives else None
+    )
     return Request(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
-        sampling_params=SamplingParams(max_tokens=1),
+        sampling_params=SamplingParams(max_tokens=1, extra_args=extra_args),
         pooling_params=None,
         mm_features=None,
         block_hasher=get_request_block_hasher(RING_BLOCK, sha256),
@@ -205,7 +211,7 @@ def _req_block_ids(scheduler: Scheduler, group: int, req_id: str) -> list[int]:
 
 
 def _admit_cpu_hit_with_fresh_request(
-    scheduler: Scheduler,
+    scheduler: Scheduler, directives: dict | None = None
 ) -> tuple[SchedulerOutput, SimpleCPUOffloadMetadata, Request, Request]:
     """Offload a finished prompt to the CPU tier, drop it from the GPU prefix
     cache, then admit a repeat of it (async CPU load) together with a fresh
@@ -222,7 +228,7 @@ def _admit_cpu_hit_with_fresh_request(
         _step(scheduler)
     assert scheduler.kv_cache_manager.reset_prefix_cache()
 
-    repeat = _make_request("B", prompt)
+    repeat = _make_request("B", prompt, directives)
     fresh = _make_request("C", list(range(5000, 5000 + 40)))
     manager = scheduler.connector.scheduler_manager
     _, hit_tokens = manager.cpu_coordinator.find_longest_cache_hit(
@@ -367,7 +373,6 @@ def test_new_block_ids_are_drained_without_zeroing() -> None:
 
 # --- Failed loads on the hybrid layout (fingerprint gate) ---
 
-from vllm.v1.simple_kv_offload.fingerprint import BLOCK_STATE  # noqa: E402
 from vllm.v1.simple_kv_offload.stats import (  # noqa: E402
     LOAD_FAILED_BLOCKS,
     LOAD_FAILED_REQUESTS,
@@ -389,9 +394,10 @@ def test_failed_async_load_on_hybrid_layout_recomputes_the_prompt(which: str) ->
     assert loaded_gpu == meta.load_gpu_blocks and len(state.kinds) == len(loaded_gpu)
     assert meta.load_spans == {meta.load_event: [(0, len(loaded_gpu))]}
     assert all(gid in manager._gpu_offloaded for gid in loaded_gpu)
-    state_blocks = [g for g, k in zip(loaded_gpu, state.kinds) if k == BLOCK_STATE]
-    assert state_blocks, "the load carries no Mamba state block"
     mamba_group = len(scheduler.kv_cache_config.kv_cache_groups) - 1
+    state_blocks = [g for g, k in zip(loaded_gpu, state.kinds) if k == mamba_group]
+    assert state_blocks, "the load carries no Mamba state block"
+    assert set(state.kinds) <= {FA_GROUP, mamba_group}
     mamba_blocks = _req_block_ids(scheduler, mamba_group, "B")
     if which == "every_block":
         invalid = set(loaded_gpu)
@@ -485,3 +491,66 @@ def test_invalid_blocks_truncate_to_the_shortest_valid_prefix_across_groups() ->
     assert affected == {"D"} and request.num_computed_tokens == start + FA_BLOCK
     assert tokens == computed - start - FA_BLOCK
     assert set(fa_blocks[idx_f:]) <= evict and not set(mamba_blocks) & evict
+
+
+def test_request_directives_reach_the_worker_metadata() -> None:
+    """kv_transfer_params["simple_cpu"] of a real request, through
+    update_state_after_alloc and build_connector_meta: controls ride on
+    the next step even without a CPU hit; gate and corrupt spans are keyed
+    by the request's load event and kept while it is pending."""
+    scheduler = _make_scheduler({"allow_request_directives": True, "fingerprint": True})
+    manager = scheduler.connector.scheduler_manager
+    # A short request with a control only: no load, controls in this step's
+    # metadata and in no later one.
+    scheduler.add_request(
+        _make_request(
+            "K", list(range(3000, 3040)), {"control": {"qsa_grouped_page4": "0"}}
+        )
+    )
+    _, meta = _step(scheduler)
+    assert meta.controls == {"qsa_grouped_page4": "0"} and meta.load_event < 0
+    _, meta = _step(scheduler)
+    assert meta.controls == {}
+    for _ in range(8):
+        _step(scheduler)
+        if "K" not in scheduler.requests:
+            break
+    assert "K" not in scheduler.requests
+
+    # A CPU hit with gate + corrupt: spans per request, kinds per block.
+    _, meta, repeat, _ = _admit_cpu_hit_with_fresh_request(
+        scheduler, {"gate": True, "corrupt": "nan_v_tail=2"}
+    )
+    event = meta.load_event
+    n = len(meta.load_gpu_blocks)
+    assert event >= 0 and n > 0
+    assert meta.load_spans[event] == [(0, n)]
+    assert meta.load_corrupt[event] == [(0, n, "nan_v_tail=2")]
+    assert meta.load_gate[event] is True
+    assert len(meta.load_block_kinds) == n
+    assert manager._reqs_to_load["B"].directives.gate
+    # Still there on the next step (the worker reads them when the copy
+    # completes), gone once the load finished.
+    _, meta2 = _step(scheduler)
+    assert meta2.load_gate.get(event) is True and event in meta2.load_spans
+    _step(scheduler, finished_recving={"B"})
+    assert event not in manager._load_spans and event not in manager._load_gate
+    assert event not in manager._load_corrupt
+
+    # A rejected directive is ignored, the request still runs.
+    scheduler2 = _make_scheduler({"allow_request_directives": True})
+    scheduler2.add_request(
+        _make_request("R", list(range(4000, 4040)), {"corrupt": "melt=1"})
+    )
+    _, meta = _step(scheduler2)
+    assert meta.controls == {} and "R" in scheduler2.requests
+
+    # Without allow_request_directives nothing is read.
+    scheduler3 = _make_scheduler()
+    scheduler3.add_request(
+        _make_request(
+            "N", list(range(4100, 4140)), {"control": {"qsa_grouped_page4": "0"}}
+        )
+    )
+    _, meta = _step(scheduler3)
+    assert meta.controls == {}

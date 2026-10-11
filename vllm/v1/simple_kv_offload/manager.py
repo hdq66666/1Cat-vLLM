@@ -23,11 +23,7 @@ from vllm.v1.core.kv_cache_utils import get_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.simple_kv_offload.fingerprint import (
-    BLOCK_ATTN,
-    BLOCK_STATE,
-    BLOCK_UNKNOWN,
-)
+from vllm.v1.simple_kv_offload.fingerprint import BLOCK_UNKNOWN
 from vllm.v1.simple_kv_offload.host_mem import GiB, read_mem_available_bytes
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -159,8 +155,8 @@ class LoadRequestState:
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
-    # Block kinds parallel to transfer_meta.gpu_block_ids (fingerprint
-    # BLOCK_ATTN / BLOCK_STATE) and the request's directives, if any.
+    # Block kinds parallel to transfer_meta.gpu_block_ids (the KV cache
+    # group of each block, see fingerprint) and the request's directives.
     kinds: list[int] = field(default_factory=list)
     directives: Directives | None = None
     # For the admission / completion log lines.
@@ -280,7 +276,6 @@ class SimpleCPUOffloadScheduler:
         self._load_gate: dict[int, bool] = {}
         # Runtime controls requested by directives, sent with the next step.
         self._pending_controls: dict[str, str] = {}
-        self._gpu_block_kinds: dict[int, int] = {}
 
         # CPU hits found by get_num_new_matched_tokens(), kept pinned via
         # touch() while awaiting update_state_after_alloc().
@@ -812,7 +807,7 @@ class SimpleCPUOffloadScheduler:
 
         for g in range(num_groups):
             spec = kv_cache_groups[g].kv_cache_spec
-            block_kind = BLOCK_STATE if isinstance(spec, MambaSpec) else BLOCK_ATTN
+            block_kind = g  # the owner's KV cache group (fingerprint block kind)
             if not spec.prefix_cacheable:
                 # Per-request scratch; get_num_new_matched_tokens() refuses
                 # hits with blocks in these groups.
@@ -1043,22 +1038,13 @@ class SimpleCPUOffloadScheduler:
         return result
 
     def _block_kind(self, gpu_block_id: int) -> int:
-        """What a hashed GPU block's owner keeps in it (fingerprint
-        BLOCK_ATTN / BLOCK_STATE), from its hash's KV cache group."""
+        """A hashed GPU block's kind for the fingerprint chain: the KV cache
+        group of its hash, BLOCK_UNKNOWN without a hash."""
         assert self._gpu_block_pool is not None
         bhash = self._gpu_block_pool.blocks[gpu_block_id].block_hash
         if bhash is None:
             return BLOCK_UNKNOWN
-        group_id = get_group_id(bhash)
-        kind = self._gpu_block_kinds.get(group_id)
-        if kind is None:
-            groups = self.cpu_kv_cache_config.kv_cache_groups
-            if group_id >= len(groups):
-                return BLOCK_UNKNOWN
-            spec = groups[group_id].kv_cache_spec
-            kind = BLOCK_STATE if isinstance(spec, MambaSpec) else BLOCK_ATTN
-            self._gpu_block_kinds[group_id] = kind
-        return kind
+        return get_group_id(bhash)
 
     def _maybe_check_host_mem(self) -> None:
         """Sample host MemAvailable every HOST_MEM_CHECK_INTERVAL_S seconds."""

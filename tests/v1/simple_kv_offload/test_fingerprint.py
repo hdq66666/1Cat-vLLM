@@ -5,9 +5,9 @@ stay silent on a faithful transfer and name the stage that broke otherwise."""
 
 import pytest
 import torch
+from vllm.v1.simple_kv_offload.options import parse_options
 
 from vllm.v1.simple_kv_offload.fingerprint import WATCH_STEPS, FingerprintChain
-from vllm.v1.simple_kv_offload.options import parse_options
 
 NUM_GPU, NUM_CPU, REGIONS = 12, 20, {"fa": 64, "state": 40}
 
@@ -374,6 +374,8 @@ def _make_typed(**kwargs):
         start_thread=False,
         gpu_views=gpu_views,
         cpu_views=cpu_views,
+        region_groups={"fa": BLOCK_ATTN, "state": BLOCK_STATE},
+        state_groups={BLOCK_STATE},
         **kwargs,
     )
     return chain, gpu, cpu, gpu_views, cpu_views
@@ -582,3 +584,38 @@ def test_views_are_validated():
         gpu, cpu, rank=0, start_thread=False, gpu_views={"fa": [("attn", gpu["fa"])]}
     )
     assert chain.count_nonfinite(None, [1], [BLOCK_ATTN]) is None
+
+
+def test_regions_are_counted_for_their_own_group_only():
+    """A block is counted only in the regions of its owner's KV cache group:
+    an attention region of another group (e.g. the QSA ring) holds whatever
+    an earlier owner left there."""
+    chain, gpu, cpu, gv, cv = _make_typed()
+    # Re-tag: "fa" belongs to group 2, no loaded block is owned by group 2.
+    chain = FingerprintChain(
+        gpu,
+        cpu,
+        rank=0,
+        start_thread=False,
+        gpu_views=gv,
+        cpu_views=cv,
+        region_groups={"fa": 2, "state": 1},
+        state_groups={1},
+    )
+    gv["fa"][1][1][3, 0] = float("nan")
+    snap = chain.count_nonfinite(None, [3, 4, 5], [0, 0, 1])
+    counts = snap.wait()
+    assert int(counts[0, 0]) == -1  # "fa" (group 2) not counted for group 0
+    assert int(counts[1, 2]) == 0  # "state" counted for the group-1 block
+    host = chain._host_nonfinite([7, 8, 9], [0, 0, 1])
+    assert int(host[0, 0]) == -1 and int(host[1, 2]) == 0
+    # With the block owned by group 2 the NaN is counted.
+    counts = chain.count_nonfinite(None, [3, 4, 5], [2, 0, 1]).wait()
+    assert int(counts[0, 0]) == 1
+    # Corrupt modes tell attention from state blocks by state_groups.
+    chain.load_launched(
+        0, [7, 8, 9], [3, 4, 5], kinds=[2, 2, 1], corrupt=[(0, 3, "nan_v_tail=1")]
+    )
+    chain.load_seen_complete(0)
+    assert torch.isnan(gv["fa"][1][1][4]).all()
+    assert torch.isfinite(gv["fa"][1][1][5]).all()

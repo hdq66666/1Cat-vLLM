@@ -69,6 +69,9 @@ _SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
 _SM70_QSA_GROUPED_PAGE4 = os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4", "1") == "1"
 _SM70_QSA_GROUPED_PAD_FIX = os.getenv("VLLM_SM70_QSA_GROUPED_PAD_FIX", "1") == "1"
 _SM70_QSA_GROUPED_PAGE4_QUERIES = 8
+# Calls of the grouped route so far (diagnostics: a runtime switch of
+# _SM70_QSA_GROUPED_PAGE4 is confirmed by this counter standing still).
+_SM70_QSA_GROUPED_PAGE4_CALLS = 0
 _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
     _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
 )
@@ -1851,6 +1854,8 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     v_scale: float,
     flash_attn_v100_cuda,
 ) -> torch.Tensor:
+    global _SM70_QSA_GROUPED_PAGE4_CALLS
+    _SM70_QSA_GROUPED_PAGE4_CALLS += 1
     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
         _qsa_grouped_page4_workspace(q)
     )

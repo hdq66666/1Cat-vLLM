@@ -28,9 +28,9 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_cpu_blocks: list[int] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
-    # What each loaded block's owner keeps in it (fingerprint.BLOCK_ATTN /
-    # BLOCK_STATE / BLOCK_UNKNOWN), parallel to load_gpu_blocks; empty when
-    # the fingerprint chain is off.
+    # The KV cache group of each loaded block's owner (fingerprint block
+    # kinds; BLOCK_UNKNOWN without a hash), parallel to load_gpu_blocks;
+    # empty when the fingerprint chain is off.
     load_block_kinds: list[int] = field(default_factory=list)
     # Per load event, kept while the event is pending like
     # load_event_to_reqs: the [start, end) span of each request's blocks in

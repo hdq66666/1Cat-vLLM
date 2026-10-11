@@ -57,10 +57,14 @@ logger = init_logger(__name__)
 # checked again on the compute stream.
 WATCH_STEPS = (0, 2, 4, 6)
 _MAX_REPORTED = 4
+_MAX_VERDICTS = 256
 
-# Block kinds of a transfer: what the block's owner keeps in it.
-BLOCK_ATTN = 0  # full-attention K/V (plus whatever the state regions hold)
-BLOCK_STATE = 1  # state-space state (plus whatever the K/V regions hold)
+# A transferred block's kind is the KV cache group of its owner: only the
+# regions of that group hold the block's data, every other region's row is
+# whatever an earlier owner left there. Without a KV cache config the chain
+# assumes group 0 = attention regions, group 1 = state regions.
+BLOCK_ATTN = 0
+BLOCK_STATE = 1
 BLOCK_UNKNOWN = -1
 
 # Parts of a region, for typed views: K or V of an attention layer, a whole
@@ -154,7 +158,13 @@ class FingerprintChain:
         start_thread: bool = True,
         gpu_views: Views | None = None,
         cpu_views: Views | None = None,
+        region_groups: dict[str, int] | None = None,
+        state_groups: set[int] | None = None,
     ) -> None:
+        """region_groups: the KV cache group of every region with typed
+        views; state_groups: the groups of state-space layers. Without them
+        attention regions are group BLOCK_ATTN and state regions group
+        BLOCK_STATE."""
         self.rank = rank
         self.names = list(gpu_regions)
         # int64 views [blocks, words]: reductions over them allocate nothing
@@ -191,6 +201,22 @@ class FingerprintChain:
             self._region_kind.append(
                 "state" if "state" in kinds else "attn" if kinds else "other"
             )
+        # The group whose blocks a region is counted for (BLOCK_UNKNOWN: never).
+        self._state_groups = (
+            set(state_groups) if state_groups is not None else {BLOCK_STATE}
+        )
+        self._region_group: list[int] = []
+        for name, kind in zip(self.names, self._region_kind):
+            if region_groups is not None:
+                self._region_group.append(region_groups.get(name, BLOCK_UNKNOWN))
+            else:
+                self._region_group.append(
+                    BLOCK_STATE
+                    if kind == "state"
+                    else BLOCK_ATTN
+                    if kind == "attn"
+                    else BLOCK_UNKNOWN
+                )
         self._countable = any(self._parts)
         # Fault injection for experiments: {load number: mode}, see
         # parse_corrupt_plan(). Applied on the compute stream when the load
@@ -207,8 +233,9 @@ class FingerprintChain:
         # meaningful while no later store was launched into the block.
         self._cpu_seq: dict[int, int] = {}
         self._seq = 0
-        # (is_store, event) -> (GPU ids, block kinds) of launched transfers;
-        # the copy thread reads an entry after the launch was queued to it.
+        # (is_store, event) -> (GPU ids, block kinds) of launched transfers.
+        # Written here before the copy is queued, read by the copy thread
+        # (nonfinite) and dropped here again (tick): the queue orders them.
         self._event_blocks: dict[
             tuple[bool, int], tuple[list[int], list[int] | None]
         ] = {}
@@ -305,11 +332,12 @@ class FingerprintChain:
         event completed. Nothing here waits for the GPU."""
         if not self._countable or not gpu_ids or kinds is None:
             return None
-        positions = {
-            "attn": [i for i, k in enumerate(kinds) if k == BLOCK_ATTN],
-            "state": [i for i, k in enumerate(kinds) if k == BLOCK_STATE],
-        }
-        if not positions["attn"] and not positions["state"]:
+        # Positions of the blocks owned by each group with counted regions.
+        positions: dict[int, list[int]] = {}
+        for group in set(self._region_group):
+            if group != BLOCK_UNKNOWN:
+                positions[group] = [i for i, k in enumerate(kinds) if k == group]
+        if not any(positions.values()):
             return None
         n = len(gpu_ids)
         device = self._gpu[0].device
@@ -335,7 +363,7 @@ class FingerprintChain:
             for r, parts in enumerate(self._parts):
                 if not parts:
                     continue
-                pos = positions[self._region_kind[r]]
+                pos = positions.get(self._region_group[r])
                 if not pos:
                     continue
                 ids = index([gpu_ids[i] for i in pos])
@@ -378,7 +406,9 @@ class FingerprintChain:
             views = [cv for _, _, cv in parts if cv is not None]
             if not parts or len(views) != len(parts):
                 continue
-            want = BLOCK_STATE if self._region_kind[r] == "state" else BLOCK_ATTN
+            want = self._region_group[r]
+            if want == BLOCK_UNKNOWN:
+                continue
             for i, cid in enumerate(cpu_ids):
                 if kinds[i] != want:
                     continue
@@ -486,8 +516,8 @@ class FingerprintChain:
             attn = gpu_ids
             state = gpu_ids
         else:
-            attn = [g for g, k in zip(gpu_ids, kinds) if k != BLOCK_STATE]
-            state = [g for g, k in zip(gpu_ids, kinds) if k == BLOCK_STATE]
+            attn = [g for g, k in zip(gpu_ids, kinds) if k not in self._state_groups]
+            state = [g for g, k in zip(gpu_ids, kinds) if k in self._state_groups]
         if kind in ("zero_state", "nan_state"):
             targets = state[-count:]
         elif kind.endswith("_tail"):
@@ -886,6 +916,9 @@ class FingerprintChain:
         bad += len(restored_nf)
         with self._lock:
             self._verdicts[event_idx] = sorted(verdict)
+            # Only gated loads are taken; keep the rest bounded.
+            while len(self._verdicts) > _MAX_VERDICTS:
+                self._verdicts.pop(next(iter(self._verdicts)))
         self.counters["loads"] += 1
         logger.info(
             "SimpleCPU fp load rank=%d event=%d blocks=%d known=%d digest=%016x "

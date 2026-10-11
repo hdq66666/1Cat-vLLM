@@ -72,6 +72,10 @@ _STORE_STAT_KEYS = (
 )
 
 
+# Steps between "SimpleCPU control status" log lines while a control is on.
+_CONTROL_STATUS_EVERY = 200
+
+
 class _Launch(NamedTuple):
     """A launched transfer, kept on the main thread until it completes."""
 
@@ -173,6 +177,7 @@ class SimpleCPUOffloadWorker:
         self._invalid_block_ids: set[int] = set()
         # Runtime controls applied through request directives, name -> value.
         self._controls: dict[str, str] = {}
+        self._control_calls = 0
 
     def register_kv_caches(
         self,
@@ -342,7 +347,9 @@ class SimpleCPUOffloadWorker:
         )
         if self.options.fingerprint:
             try:
-                gpu_views, cpu_views = self._typed_views(kv_caches, seen_ptrs)
+                gpu_views, cpu_views, region_groups, state_groups = self._typed_views(
+                    kv_caches, seen_ptrs
+                )
                 self._fp = FingerprintChain(
                     self.gpu_kv_caches,
                     self.cpu_kv_caches,
@@ -352,6 +359,8 @@ class SimpleCPUOffloadWorker:
                     corrupt_plan=self.options.fingerprint_corrupt_plan,
                     gpu_views=gpu_views,
                     cpu_views=cpu_views,
+                    region_groups=region_groups,
+                    state_groups=state_groups,
                 )
                 self._backend.fp = self._fp
             except Exception:
@@ -365,14 +374,19 @@ class SimpleCPUOffloadWorker:
     ) -> tuple[
         dict[str, list[tuple[str, torch.Tensor]]],
         dict[str, list[tuple[str, torch.Tensor]]],
+        dict[str, int],
+        set[int],
     ]:
         """Typed [blocks, ...] views of every registered region and of its
         CPU mirror, tagged with what the region holds (fingerprint
         REGION_PARTS): K and V of an attention layer whose cache is laid out
         (blocks, 2, ...) or (2, blocks, ...), a whole attention region
-        otherwise, or each state tensor of a state-space layer. The KV cache
-        groups decide between attention and state; without them the layout
-        does (a list of tensors is a state-space layer)."""
+        otherwise, or each state tensor of a state-space layer. Also the KV
+        cache group of every region and the groups of the state-space
+        layers, so the chain counts a block only in its owner's regions.
+        Without KV cache groups the layout decides (a list of tensors is a
+        state-space layer): attention regions are group 0, state regions
+        group 1. Views never copy: a layout that cannot be viewed raises."""
         from vllm.v1.kv_cache_interface import MambaSpec
 
         assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
@@ -381,8 +395,14 @@ class SimpleCPUOffloadWorker:
         for g, group in enumerate(groups):
             for layer_name in group.layer_names:
                 group_of[layer_name] = g
+        state_groups = {
+            g
+            for g, group in enumerate(groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
         gpu_views: dict[str, list[tuple[str, torch.Tensor]]] = {}
         cpu_views: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        region_groups: dict[str, int] = {}
         num_blocks = self.gpu_kv_caches[next(iter(self.gpu_kv_caches))].shape[0]
         for name, tensor in seen_ptrs.values():
             value = kv_caches[name]
@@ -393,6 +413,10 @@ class SimpleCPUOffloadWorker:
                 if spec is not None
                 else isinstance(value, list)
             )
+            if gi is None:
+                gi = 1 if is_state else 0
+                if is_state:
+                    state_groups.add(1)
             if is_state:
                 state = value if isinstance(value, list) else [value]
                 raw = self.gpu_kv_caches.get(name)
@@ -420,6 +444,7 @@ class SimpleCPUOffloadWorker:
                     )
                 gpu_views[name] = parts
                 cpu_views[name] = cparts
+                region_groups[name] = gi
                 continue
             assert isinstance(value, torch.Tensor)
             if (
@@ -436,6 +461,7 @@ class SimpleCPUOffloadWorker:
                         cpu_views[region] = [
                             (part, cpu.view(value.dtype).view(cpu.shape[0], -1))
                         ]
+                        region_groups[region] = gi
                 continue
             if name not in self.gpu_kv_caches:
                 continue
@@ -446,16 +472,17 @@ class SimpleCPUOffloadWorker:
                 and value.shape[1] == 2
             ):
                 # (blocks, 2, ...): K and V halves of one region.
-                flat = value.reshape(num_blocks, 2, -1)
+                flat = value.view(num_blocks, 2, -1)
                 cflat = cpu.view(value.dtype).view(cpu.shape[0], 2, -1)
                 gpu_views[name] = [("k", flat[:, 0]), ("v", flat[:, 1])]
                 cpu_views[name] = [("k", cflat[:, 0]), ("v", cflat[:, 1])]
             else:
-                gpu_views[name] = [("attn", value.reshape(num_blocks, -1))]
+                gpu_views[name] = [("attn", value.view(num_blocks, -1))]
                 cpu_views[name] = [
                     ("attn", cpu.view(value.dtype).view(cpu.shape[0], -1))
                 ]
-        return gpu_views, cpu_views
+            region_groups[name] = gi
+        return gpu_views, cpu_views, region_groups, state_groups
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         if metadata.num_cpu_blocks and metadata.num_cpu_blocks != self.num_cpu_blocks:
@@ -500,8 +527,28 @@ class SimpleCPUOffloadWorker:
                 continue
             self._controls[name] = value
             logger.warning(
-                "SimpleCPU control applied rank=%d %s=%s", _global_rank(), name, value
+                "SimpleCPU control applied rank=%d %s=%s %s",
+                _global_rank(),
+                name,
+                value,
+                self._control_status(),
             )
+
+    @staticmethod
+    def _control_status() -> str:
+        """The SM70 QSA grouped page4 route's call count and switches: the
+        count stops moving once the route is off."""
+        import importlib
+
+        try:
+            qsa = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa")
+        except Exception:
+            return "qsa=unavailable"
+        return (
+            f"grouped_page4_calls={getattr(qsa, '_SM70_QSA_GROUPED_PAGE4_CALLS', '?')}"
+            f" grouped={getattr(qsa, '_SM70_QSA_GROUPED_PAGE4', '?')}"
+            f" pad_fix={getattr(qsa, '_SM70_QSA_GROUPED_PAD_FIX', '?')}"
+        )
 
     def start_load_kv(self) -> None:
         # NOTE: we defer launching both load and store to get_finished(),
@@ -560,6 +607,15 @@ class SimpleCPUOffloadWorker:
         self._run_block_probe(metadata)
         if self._fp is not None:
             self._fp.tick(torch.cuda.current_stream())
+        if self._controls:
+            self._control_calls += 1
+            if self._control_calls % _CONTROL_STATUS_EVERY == 0:
+                logger.info(
+                    "SimpleCPU control status rank=%d %s %s",
+                    _global_rank(),
+                    self._controls,
+                    self._control_status(),
+                )
         if self.options.debug_gpu_sleep_cycles > 0:
             torch.cuda._sleep(self.options.debug_gpu_sleep_cycles)
         if self.options.debug_host_sleep_ms > 0:
@@ -702,12 +758,17 @@ class SimpleCPUOffloadWorker:
             else:
                 kinds = metadata.load_block_kinds if metadata is not None else []
                 corrupt = metadata.load_corrupt.get(event_idx) if metadata else None
+                spans = (
+                    [(start, end, mode) for start, end, mode in corrupt]
+                    if corrupt
+                    else None
+                )
                 self._fp.load_launched(
                     event_idx,
                     cpu_blocks,
                     gpu_blocks,
                     kinds=list(kinds) if len(kinds) == len(gpu_blocks) else None,
-                    corrupt=[tuple(span) for span in corrupt] if corrupt else None,  # type: ignore[misc]
+                    corrupt=spans,
                 )
                 if metadata is not None and metadata.load_gate.get(event_idx):
                     # The deadline starts when the copy completes.
