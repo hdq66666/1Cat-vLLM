@@ -171,6 +171,86 @@ def _fill_random(worker: SimpleCPUOffloadWorker, gpu: bool) -> None:
         t.copy_(torch.randint(-128, 128, t.shape, dtype=torch.int8))
 
 
+# --- Fingerprint chain through the real worker and copy thread ---
+
+
+def _fp_round_trip(worker: SimpleCPUOffloadWorker, steps_after_load: int = 9) -> None:
+    """Store three blocks, reuse their GPU blocks, load them elsewhere and
+    keep stepping, the way the model runner does (inference mode)."""
+    with torch.inference_mode():
+        _fill_random(worker, gpu=True)
+        _drive(
+            worker,
+            SimpleCPUOffloadMetadata(
+                store_event=0,
+                store_gpu_blocks=[1, 4, 7],
+                store_cpu_blocks=[5, 0, 2],
+                num_cpu_blocks=NUM_CPU_BLOCKS,
+            ),
+            stores=(0,),
+        )
+        for t in worker.gpu_kv_caches.values():
+            t[[1, 4, 7]] = 1
+        _drive(
+            worker,
+            SimpleCPUOffloadMetadata(
+                load_event=0,
+                load_cpu_blocks=[5, 0, 2],
+                load_gpu_blocks=[3, 6, 0],
+                load_event_to_reqs={0: ["req"]},
+                num_cpu_blocks=NUM_CPU_BLOCKS,
+            ),
+            recv=("req",),
+        )
+        for _ in range(steps_after_load):
+            _step(worker, SimpleCPUOffloadMetadata())
+    torch.accelerator.synchronize()
+    assert worker._fp is not None
+    worker._fp.close()
+    worker._fp._thread.join(30)
+    assert not worker._fp._thread.is_alive()
+
+
+def test_fingerprint_is_silent_on_a_faithful_round_trip(make_worker) -> None:
+    worker = make_worker(fingerprint=True)
+    _fp_round_trip(worker)
+    fp = worker._fp
+    assert fp.counters["stores"] == 1 and fp.counters["loads"] == 1
+    assert fp.counters["watches"] == 4
+    assert fp.counters["mismatch_events"] == 0, fp.reports
+
+
+def test_fingerprint_reports_the_injected_faults(make_worker) -> None:
+    worker = make_worker(fingerprint=True, fingerprint_inject_gpu_load=1)
+    _fp_round_trip(worker)
+    assert worker._fp.reports == ["watch +2 steps", "watch +4 steps", "watch +6 steps"]
+
+    worker = make_worker(fingerprint=True, fingerprint_inject_cpu_load=1)
+    _fp_round_trip(worker)
+    assert worker._fp.reports == [
+        "load cpu-at-rest",
+        "load end-to-end(gpu source vs gpu restored)",
+    ]
+
+
+def test_fingerprint_reports_a_corrupting_copy(
+    make_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = make_worker(fingerprint=True)
+    real_copy = DmaCopyBackend._copy
+    calls = []
+
+    def copy(src_blocks, dst_blocks, params):
+        calls.append(1)
+        if len(calls) == 2:  # the load: deliver block 5 into every destination
+            src_blocks = [src_blocks[0]] * len(src_blocks)
+        real_copy(src_blocks, dst_blocks, params)
+
+    monkeypatch.setattr(DmaCopyBackend, "_copy", staticmethod(copy))
+    _fp_round_trip(worker)
+    assert "load cpu->gpu" in worker._fp.reports
+
+
 # --- Copy backend selection (P8) ---
 
 

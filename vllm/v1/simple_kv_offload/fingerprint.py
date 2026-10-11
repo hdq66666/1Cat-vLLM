@@ -148,7 +148,10 @@ class FingerprintChain:
             with self._lock:
                 self._free.append(snap.host)
 
+    @torch.inference_mode()
     def snapshot(self, stream: Any) -> Snapshot:
+        # Host buffers are shared by the engine thread (inference mode) and
+        # the copy thread: every use of them runs in inference mode.
         host = self._host_buffer()
         if not self._on_cuda:
             host.copy_(torch.stack([r.sum(dim=1) for r in self._gpu]))
@@ -281,6 +284,7 @@ class FingerprintChain:
             if job is not None:
                 self.process(job)
 
+    @torch.inference_mode()
     def process(self, job: tuple) -> None:
         kind = job[0]
         if kind == "store_launch":
