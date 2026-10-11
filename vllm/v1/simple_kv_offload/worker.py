@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.fingerprint import FingerprintChain
 from vllm.v1.simple_kv_offload.host_mem import (
     GiB,
     check_host_mem_before_pinning,
@@ -160,6 +161,8 @@ class SimpleCPUOffloadWorker:
         self._probe_steps: list[int] = []
         self._probe_last: torch.Tensor | None = None
         self._probe_disabled = False
+        # Diagnostic fingerprint chain (options.fingerprint).
+        self._fp: FingerprintChain | None = None
 
     def register_kv_caches(
         self,
@@ -327,6 +330,19 @@ class SimpleCPUOffloadWorker:
             self.store_stream,
             copy_backend=self.options.copy_backend,
         )
+        if self.options.fingerprint:
+            try:
+                self._fp = FingerprintChain(
+                    self.gpu_kv_caches,
+                    self.cpu_kv_caches,
+                    rank,
+                    inject_gpu_load=self.options.fingerprint_inject_gpu_load,
+                    inject_cpu_load=self.options.fingerprint_inject_cpu_load,
+                )
+                self._backend.fp = self._fp
+            except Exception:
+                logger.exception("SimpleCPU fp could not be enabled")
+                self._fp = None
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         if metadata.num_cpu_blocks and metadata.num_cpu_blocks != self.num_cpu_blocks:
@@ -399,6 +415,8 @@ class SimpleCPUOffloadWorker:
                 )
 
         self._run_block_probe(metadata)
+        if self._fp is not None:
+            self._fp.tick(torch.cuda.current_stream())
         if self.options.debug_gpu_sleep_cycles > 0:
             torch.cuda._sleep(self.options.debug_gpu_sleep_cycles)
         if self.options.debug_host_sleep_ms > 0:
@@ -521,6 +539,14 @@ class SimpleCPUOffloadWorker:
         self._check_block_ids(cpu_blocks, gpu_blocks)
         launches = self._store_launches if is_store else self._load_launches
         launches[event_idx] = _Launch(self._clock(), cpu_blocks, gpu_blocks)
+        if self._fp is not None:
+            # Before the copy is queued, so the checker sees the launch first.
+            if is_store:
+                self._fp.store_launched(
+                    event_idx, gpu_blocks, cpu_blocks, torch.cuda.current_stream()
+                )
+            else:
+                self._fp.load_launched(event_idx, cpu_blocks, gpu_blocks)
         if is_store:
             self._backend.launch_copy(
                 gpu_blocks,
@@ -646,6 +672,8 @@ class SimpleCPUOffloadWorker:
         launch = launches.pop(transfer.event_idx, None)
         if launch is None:
             return
+        if self._fp is not None and not is_store:
+            self._fp.load_seen_complete(transfer.event_idx)
         ready_ms = (self._clock() - launch.launch_time) * 1000
         dma_ms = transfer.start.elapsed_time(transfer.done)
         num_blocks = len(launch.gpu_blocks)

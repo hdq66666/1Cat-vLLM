@@ -79,6 +79,14 @@ class SimpleCPUOffloadOptions:
     # a transfer).
     debug_host_sleep_ms: float = 0.0
     debug_gpu_sleep_cycles: int = 0
+    # fingerprint: follow every transferred block with per-region checksums
+    # taken on the transfer and compute streams and on the host, without
+    # host synchronization, and warn about any difference (see fingerprint.py).
+    # fingerprint_inject_gpu_load / _cpu_load: positive controls, change one
+    # word of the first block of the N-th load (1-based) after / before it.
+    fingerprint: bool = False
+    fingerprint_inject_gpu_load: int = 0
+    fingerprint_inject_cpu_load: int = 0
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -144,7 +152,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["cpu_bytes_to_use_per_rank"] = _as_int(
             "cpu_bytes_to_use_per_rank", cfg["cpu_bytes_to_use_per_rank"], 1
         )
-    for key in ("lazy_offload", "allow_restore", "log_transfer_blocks"):
+    for key in ("lazy_offload", "allow_restore", "log_transfer_blocks", "fingerprint"):
         if key in cfg:
             kwargs[key] = _as_bool(key, cfg[key])
     if "copy_backend" in cfg:
@@ -165,6 +173,8 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         "freed_block_quarantine_steps",
         "probe_block",
         "debug_gpu_sleep_cycles",
+        "fingerprint_inject_gpu_load",
+        "fingerprint_inject_cpu_load",
     ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)

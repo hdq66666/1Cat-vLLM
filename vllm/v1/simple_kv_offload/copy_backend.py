@@ -7,7 +7,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
@@ -69,6 +69,8 @@ class DmaCopyBackend:
         self._cond = threading.Condition()
         self._num_enqueued: int = 0
         self._num_issued: int = 0
+        # Diagnostic fingerprint chain (options.fingerprint), set by the worker.
+        self.fp: Any = None
 
     def init(
         self,
@@ -192,11 +194,18 @@ class DmaCopyBackend:
                         "injected copy failure (VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY)"
                     )
                 stream = store_stream if is_store else load_stream
+                fp = self.fp
+                pre = fp.snapshot(stream) if fp is not None and is_store else None
                 start = torch.Event(enable_timing=True)
                 start.record(stream)
                 self._copy(src_blocks, dst_blocks, params)
+                # The post-copy checksums are part of the transfer: the copy
+                # is reported complete only after they were taken.
+                post = fp.snapshot(stream) if fp is not None else None
                 done = torch.Event(enable_timing=True)
                 done.record(stream)
+                if fp is not None:
+                    fp.transfer_issued(is_store, event_idx, pre, post, done)
                 events_list.append(TransferEvent(event_idx, start, done))
                 # Count the copy only once its event is visible to the worker.
                 with self._cond:
