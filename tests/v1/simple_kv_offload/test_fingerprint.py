@@ -77,6 +77,7 @@ def test_faithful_round_trip_is_silent():
         "watches": len(WATCH_STEPS),
         "mismatch_events": 0,
         "skipped": 0,
+        "stale": 0,
     }
 
 
@@ -146,6 +147,24 @@ def test_load_delivers_other_bytes():
         "load end-to-end(gpu source vs gpu restored)",
         "load cpu->gpu",
     ]
+
+
+def test_stale_previous_content_is_named():
+    chain, gpu, cpu = _make()
+    _store(chain, gpu, cpu, 0, [3], [7])  # CPU block 7 holds GPU block 3
+    chain.drain()
+    old = {name: cpu[name][7].clone() for name in cpu}
+    _store(chain, gpu, cpu, 1, [5], [7])  # ... and is then reused for block 5
+    chain.drain()
+
+    def deliver_old():
+        for name in gpu:
+            gpu[name][1] = old[name]
+
+    _load(chain, gpu, cpu, 0, [7], [1], after_copy=deliver_old)
+    chain.drain()
+    assert "load cpu->gpu" in chain.reports
+    assert chain.counters["stale"] == 1
 
 
 def test_block_written_after_the_load():

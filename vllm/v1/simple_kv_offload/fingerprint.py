@@ -127,6 +127,9 @@ class FingerprintChain:
 
         # Checker thread only.
         self._cpu_fp: dict[int, torch.Tensor] = {}  # at store completion
+        # What the CPU block held before its current content: a load that
+        # delivers this is reading a stale copy of the block.
+        self._cpu_fp_prev: dict[int, torch.Tensor] = {}
         self._src_fp: dict[int, torch.Tensor] = {}  # GPU source before the store
         self._load_fp: dict[int, torch.Tensor] = {}  # event -> [regions, n] after load
         self._store_launch: dict[int, tuple[list[int], list[int], Snapshot, int]] = {}
@@ -141,6 +144,7 @@ class FingerprintChain:
             "watches": 0,
             "mismatch_events": 0,
             "skipped": 0,
+            "stale": 0,
         }
 
         self._lock = threading.Lock()
@@ -442,6 +446,9 @@ class FingerprintChain:
                 [cpu_ids[i] for i in fresh],
             )
         for i in fresh:
+            old = self._cpu_fp.get(cpu_ids[i])
+            if old is not None:
+                self._cpu_fp_prev[cpu_ids[i]] = old
             self._cpu_fp[cpu_ids[i]] = host[:, i].clone()
             self._src_fp[cpu_ids[i]] = p0[:, i].clone()
         self.counters["stores"] += 1
@@ -489,6 +496,24 @@ class FingerprintChain:
                 kc,
             )
         ok = [i for i in range(len(cpu_ids)) if valid[i]]
+        stale = [
+            i
+            for i in ok
+            if cpu_ids[i] in self._cpu_fp_prev
+            and not torch.equal(loaded[:, i], host0[:, i])
+            and torch.equal(loaded[:, i], self._cpu_fp_prev[cpu_ids[i]])
+        ]
+        if stale:
+            self.counters["stale"] += len(stale)
+            logger.warning(
+                "SimpleCPU fp STALE rank=%d event=%d: %d loaded blocks hold the "
+                "PREVIOUS content of their CPU block: positions=%s cpu=%s",
+                self.rank,
+                event_idx,
+                len(stale),
+                stale[:16],
+                [cpu_ids[i] for i in stale[:16]],
+            )
         bad += self._report(
             "load cpu->gpu",
             event_idx,
