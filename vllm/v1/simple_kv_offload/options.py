@@ -91,6 +91,15 @@ class SimpleCPUOffloadOptions:
     # ("<load number>:<mode>[=N];..." with modes zero_fa, zero_state, nan_fa,
     # swap_fa; see fingerprint.parse_corrupt_plan). Experiments only.
     fingerprint_corrupt_plan: str = ""
+    # allow_request_directives: honour the "simple_cpu" entry of a request's
+    # kv_transfer_params (experiments only; see manager.parse_directives):
+    # corrupt the request's own load like fingerprint_corrupt_plan, gate its
+    # load on the fingerprint verdict, or flip runtime controls in every
+    # worker. fingerprint_gate_timeout_s: a gated load whose verdict has not
+    # arrived within this many seconds after its copy completed is reported
+    # to the scheduler as if it were good (with a warning).
+    allow_request_directives: bool = False
+    fingerprint_gate_timeout_s: float = 5.0
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -156,7 +165,13 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["cpu_bytes_to_use_per_rank"] = _as_int(
             "cpu_bytes_to_use_per_rank", cfg["cpu_bytes_to_use_per_rank"], 1
         )
-    for key in ("lazy_offload", "allow_restore", "log_transfer_blocks", "fingerprint"):
+    for key in (
+        "lazy_offload",
+        "allow_restore",
+        "log_transfer_blocks",
+        "fingerprint",
+        "allow_request_directives",
+    ):
         if key in cfg:
             kwargs[key] = _as_bool(key, cfg[key])
     if "copy_backend" in cfg:
@@ -191,6 +206,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         ("cpu_hit_admission_wait_s", 0.0),
         ("cpu_hit_admission_max_wait_s", 0.0),
         ("debug_host_sleep_ms", 0.0),
+        ("fingerprint_gate_timeout_s", 0.0),
     ):
         if key in cfg:
             kwargs[key] = _as_float(key, cfg[key], minimum)

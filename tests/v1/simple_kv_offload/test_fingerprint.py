@@ -15,17 +15,24 @@ NUM_GPU, NUM_CPU, REGIONS = 12, 20, {"fa": 64, "state": 40}
 def _make(device="cpu", **kwargs):
     gen = torch.Generator().manual_seed(0)
     gpu = {
-        name: torch.randint(-128, 128, (NUM_GPU, size), dtype=torch.int8, generator=gen).to(device)
+        name: torch.randint(
+            -128, 128, (NUM_GPU, size), dtype=torch.int8, generator=gen
+        ).to(device)
         for name, size in REGIONS.items()
     }
-    cpu = {name: torch.zeros((NUM_CPU, size), dtype=torch.int8) for name, size in REGIONS.items()}
+    cpu = {
+        name: torch.zeros((NUM_CPU, size), dtype=torch.int8)
+        for name, size in REGIONS.items()
+    }
     if device != "cpu":
         cpu = {name: t.pin_memory() for name, t in cpu.items()}
     chain = FingerprintChain(gpu, cpu, rank=0, start_thread=False, **kwargs)
     return chain, gpu, cpu
 
 
-def _store(chain, gpu, cpu, event, gpu_ids, cpu_ids, between=None, during=None, after=None):
+def _store(
+    chain, gpu, cpu, event, gpu_ids, cpu_ids, between=None, during=None, after=None
+):
     chain.store_launched(event, gpu_ids, cpu_ids, None)
     if between:
         between()
@@ -76,9 +83,12 @@ def test_faithful_round_trip_is_silent():
         "loads": 1,
         "watches": len(WATCH_STEPS),
         "mismatch_events": 0,
+        "nonfinite_events": 0,
         "skipped": 0,
         "stale": 0,
     }
+    assert chain.pop_load_verdict(0) == []
+    assert chain.pop_load_verdict(0) is None
 
 
 def test_host_buffers_cross_inference_mode():
@@ -249,23 +259,32 @@ def test_corrupt_plan_is_validated():
     with pytest.raises(ValueError, match="unknown corrupt mode"):
         parse_options({"fingerprint_corrupt_plan": "3:melt"})
     plan = "3:zero_fa=8;19:nan_fa"
-    assert parse_options({"fingerprint_corrupt_plan": plan}).fingerprint_corrupt_plan == plan
+    assert (
+        parse_options({"fingerprint_corrupt_plan": plan}).fingerprint_corrupt_plan
+        == plan
+    )
 
 
 def test_options():
     assert parse_options({}).fingerprint is False
     options = parse_options(
-        {"fingerprint": True, "fingerprint_inject_gpu_load": 2, "fingerprint_inject_cpu_load": 3}
+        {
+            "fingerprint": True,
+            "fingerprint_inject_gpu_load": 2,
+            "fingerprint_inject_cpu_load": 3,
+        }
     )
     assert options.fingerprint and options.fingerprint_inject_gpu_load == 2
     assert options.fingerprint_inject_cpu_load == 3
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="needs CUDA")
 def test_cuda_streams_and_checker_thread():
     gen = torch.Generator().manual_seed(1)
     gpu = {
-        name: torch.randint(-128, 128, (NUM_GPU, size), dtype=torch.int8, generator=gen).cuda()
+        name: torch.randint(
+            -128, 128, (NUM_GPU, size), dtype=torch.int8, generator=gen
+        ).cuda()
         for name, size in REGIONS.items()
     }
     cpu = {
@@ -304,7 +323,7 @@ def test_cuda_streams_and_checker_thread():
         chain.load_seen_complete(event)
 
     store(0, [3, 4, 5], [7, 8, 9])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for name in gpu:
         gpu[name][[3, 4, 5]] = 1
     load(0, [7, 8, 9], [1, 2, 6])
@@ -318,3 +337,248 @@ def test_cuda_streams_and_checker_thread():
     assert chain.counters["stores"] == 1 and chain.counters["loads"] == 1
     assert chain.counters["watches"] == len(WATCH_STEPS)
     assert chain.reports == ["watch +4 steps", "watch +6 steps"]
+
+
+# --- Typed views: non-finite counts, kind-aware corrupt modes, verdicts ---
+
+from vllm.v1.simple_kv_offload.fingerprint import (  # noqa: E402
+    BLOCK_ATTN,
+    BLOCK_STATE,
+    parse_corrupt_mode,
+)
+
+
+def _make_typed(**kwargs):
+    """Regions with finite random content and typed views: "fa" holds fp16
+    K then V halves, "state" one float32 state tensor."""
+    chain, gpu, cpu = _make(**kwargs)
+    gen = torch.Generator().manual_seed(1)
+    gpu["fa"].view(torch.float16).uniform_(-1, 1, generator=gen)
+    gpu["state"].view(torch.float32).uniform_(-1, 1, generator=gen)
+    cpu["fa"].view(torch.float16).uniform_(-1, 1, generator=gen)
+    cpu["state"].view(torch.float32).uniform_(-1, 1, generator=gen)
+
+    def views(regions):
+        fa = regions["fa"].view(torch.float16)
+        half = fa.shape[1] // 2
+        return {
+            "fa": [("k", fa[:, :half]), ("v", fa[:, half:])],
+            "state": [("state", regions["state"].view(torch.float32))],
+        }
+
+    gpu_views, cpu_views = views(gpu), views(cpu)
+    chain = FingerprintChain(
+        gpu,
+        cpu,
+        rank=0,
+        start_thread=False,
+        gpu_views=gpu_views,
+        cpu_views=cpu_views,
+        **kwargs,
+    )
+    return chain, gpu, cpu, gpu_views, cpu_views
+
+
+def _store_typed(chain, gpu, cpu, event, gpu_ids, cpu_ids, kinds):
+    chain.store_launched(event, gpu_ids, cpu_ids, None, kinds=kinds)
+    pre = chain.snapshot(None)
+    nf = chain.nonfinite(None, (True, event))
+    for name in gpu:
+        cpu[name][cpu_ids] = gpu[name][gpu_ids]
+    post = chain.snapshot(None)
+    chain.transfer_issued(True, event, pre, post, None, nf)
+
+
+def _load_typed(chain, gpu, cpu, event, cpu_ids, gpu_ids, kinds, corrupt=None):
+    chain.load_launched(event, cpu_ids, gpu_ids, kinds=kinds, corrupt=corrupt)
+    for name in gpu:
+        gpu[name][gpu_ids] = cpu[name][cpu_ids]
+    post = chain.snapshot(None)
+    nf = chain.nonfinite(None, (False, event))
+    chain.transfer_issued(False, event, None, post, None, nf)
+
+
+def test_nonfinite_counts_name_the_stage():
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+    # The state region of an attention block and the K/V of a state block
+    # hold whatever: never counted.
+    gv["state"][0][1][3, 0] = float("nan")
+    gv["fa"][1][1][5, 0] = float("nan")
+    _store_typed(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9], kinds)
+    chain.drain()
+    assert chain.counters["nonfinite_events"] == 0, chain.reports
+
+    # NaN in the V of an attention block before its store: the source is
+    # named, and every later stage sees the same count.
+    gv["fa"][1][1][4, 2] = float("nan")
+    _store_typed(chain, gpu, cpu, 1, [3, 4, 5], [7, 8, 9], kinds)
+    chain.drain()
+    assert chain.reports == ["nonfinite store source(gpu before copy)"]
+    for name in gpu:
+        gpu[name][[3, 4, 5]] = 1
+    _load_typed(chain, gpu, cpu, 0, [7, 8, 9], [1, 2, 6], kinds)
+    chain.drain()
+    assert chain.reports[-2:] == [
+        "nonfinite load cpu-at-launch",
+        "nonfinite load restored(gpu after copy)",
+    ]
+    assert chain.pop_load_verdict(0) == [1]
+    assert chain.counters["mismatch_events"] == 0
+    # Non-finite values appearing after the load are named at the watch.
+    chain.load_seen_complete(0)
+    _steps(chain, 2)
+    gv["state"][0][1][6, 1] = float("inf")
+    _steps(chain, WATCH_STEPS[-1])
+    # The restored NaN is still there at every watch; the Inf written after
+    # the load shows up from the +2 watch on.
+    assert "nonfinite watch +0 steps" in chain.reports
+    assert "nonfinite watch +2 steps" in chain.reports
+    assert "watch +0 steps" not in chain.reports and "watch +2 steps" in chain.reports
+
+
+def test_load_verdict_names_blocks_differing_from_the_cpu_copy():
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+    _store_typed(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9], kinds)
+    chain.drain()
+    chain.load_launched(0, [7, 8, 9], [1, 2, 6], kinds=kinds)
+    for name in gpu:
+        gpu[name][[1, 2, 6]] = cpu[name][[7, 8, 9]]
+    gpu["fa"][6, 0] ^= 1  # the copy delivered other bytes into position 2
+    post = chain.snapshot(None)
+    chain.transfer_issued(False, 0, None, post, None, chain.nonfinite(None, (False, 0)))
+    chain.drain()
+    assert "load cpu->gpu" in chain.reports
+    assert chain.pop_load_verdict(0) == [2]
+
+
+@pytest.mark.parametrize(
+    "mode,damaged,part",
+    [
+        ("nan_v=1", [1], "v"),
+        ("nan_v=2", [1, 2], "v"),
+        ("nan_v_tail=1", [2], "v"),
+        ("nan_k=1", [1], "k"),
+        ("nan_k_tail=1", [2], "k"),
+        ("inf_v=1", [1], "v"),
+    ],
+)
+def test_corrupt_modes_hit_only_the_chosen_part(mode, damaged, part):
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+    gpu_ids = [1, 2, 6]
+    _load_typed(chain, gpu, cpu, 0, [7, 8, 9], gpu_ids, kinds, corrupt=[(0, 3, mode)])
+    chain.drain()
+    chain.load_seen_complete(0)
+    k, v = gv["fa"][0][1], gv["fa"][1][1]
+    for gid in gpu_ids:
+        hit = gid in damaged
+        target, other = (v, k) if part == "v" else (k, v)
+        assert bool(torch.isfinite(target[gid]).all()) == (not hit), (mode, gid)
+        assert torch.isfinite(other[gid]).all(), (mode, gid)
+        assert torch.isfinite(gv["state"][0][1][gid]).all()
+    if mode == "inf_v=1":
+        assert torch.isinf(v[1]).all()
+    _steps(chain, 1)
+    assert "watch +0 steps" in chain.reports
+
+
+def test_corrupt_state_modes_use_block_kinds():
+    chain, gpu, cpu, gv, cv = _make_typed()
+    # The state block is not last in the list: kinds, not position, decide.
+    kinds = [BLOCK_ATTN, BLOCK_STATE, BLOCK_ATTN]
+    _load_typed(
+        chain, gpu, cpu, 0, [7, 8, 9], [1, 6, 2], kinds, corrupt=[(0, 3, "nan_state")]
+    )
+    chain.drain()
+    chain.load_seen_complete(0)
+    assert torch.isnan(gv["state"][0][1][6]).all()
+    assert torch.isfinite(gv["state"][0][1][[1, 2]]).all()
+    assert torch.isfinite(gpu["fa"].view(torch.float16)[[1, 2, 6]]).all()
+
+    chain, gpu, cpu, gv, cv = _make_typed()
+    _load_typed(
+        chain,
+        gpu,
+        cpu,
+        0,
+        [7, 8, 9],
+        [1, 6, 2],
+        kinds,
+        corrupt=[(0, 3, "zero_state=1")],
+    )
+    chain.drain()
+    chain.load_seen_complete(0)
+    assert bool((gpu["state"][6] == 0).all()) and bool((gpu["fa"][6] == 0).all())
+    assert not bool((gpu["fa"][2] == 0).all())
+
+
+def test_corrupt_spans_apply_per_request():
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_STATE, BLOCK_ATTN, BLOCK_STATE]
+    # Two requests in one load event; only the second one asked for damage.
+    _load_typed(
+        chain,
+        gpu,
+        cpu,
+        0,
+        [7, 8, 9, 10],
+        [1, 6, 2, 9],
+        kinds,
+        corrupt=[(2, 4, "nan_v=1")],
+    )
+    chain.drain()
+    chain.load_seen_complete(0)
+    v = gv["fa"][1][1]
+    assert torch.isfinite(v[1]).all() and torch.isnan(v[2]).all()
+
+
+def test_part_modes_need_block_kinds():
+    chain, gpu, cpu = _make()
+    before = {name: t.clone() for name, t in gpu.items()}
+    chain._corrupt("nan_v=1", 0, [1, 2, 6], None)
+    chain._corrupt("nan_k_tail=1", 0, [1, 2, 6], None)
+    assert all(torch.equal(gpu[name], before[name]) for name in gpu)
+
+
+def test_corrupt_modes_are_validated():
+    assert parse_corrupt_mode("nan_v=4") == ("nan_v", 4)
+    assert parse_corrupt_mode(" inf_v ") == ("inf_v", 1)
+    with pytest.raises(ValueError, match="unknown corrupt mode"):
+        parse_corrupt_mode("melt=2")
+    with pytest.raises(ValueError, match="count"):
+        parse_corrupt_mode("nan_v=0")
+    assert parse_options(
+        {"fingerprint_corrupt_plan": "2:nan_v_tail=3"}
+    ).fingerprint_corrupt_plan
+
+
+def test_views_are_validated():
+    chain, gpu, cpu = _make()
+    with pytest.raises(ValueError, match="unknown part"):
+        FingerprintChain(
+            gpu,
+            cpu,
+            rank=0,
+            start_thread=False,
+            gpu_views={"fa": [("q", gpu["fa"].view(torch.float16))]},
+        )
+    with pytest.raises(ValueError, match="mixes"):
+        FingerprintChain(
+            gpu,
+            cpu,
+            rank=0,
+            start_thread=False,
+            gpu_views={
+                "fa": [
+                    ("k", gpu["fa"].view(torch.float16)),
+                    ("state", gpu["fa"].view(torch.float16)),
+                ]
+            },
+        )
+    # Integer views are skipped: nothing is counted.
+    chain = FingerprintChain(
+        gpu, cpu, rank=0, start_thread=False, gpu_views={"fa": [("attn", gpu["fa"])]}
+    )
+    assert chain.count_nonfinite(None, [1], [BLOCK_ATTN]) is None

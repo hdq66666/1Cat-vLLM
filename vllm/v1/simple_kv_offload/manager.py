@@ -19,9 +19,15 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_utils import get_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.fingerprint import (
+    BLOCK_ATTN,
+    BLOCK_STATE,
+    BLOCK_UNKNOWN,
+)
 from vllm.v1.simple_kv_offload.host_mem import GiB, read_mem_available_bytes
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -39,6 +45,8 @@ from vllm.v1.simple_kv_offload.stats import (
     INFLIGHT_SKIPPED,
     LOAD_DST_RECENTLY_FREED,
     LOAD_DST_YOUNG,
+    LOAD_FAILED_BLOCKS,
+    LOAD_FAILED_REQUESTS,
     LOAD_REQUESTS,
     QUARANTINE_FALLBACKS_LAST,
     QUARANTINE_SKIPPED,
@@ -86,12 +94,75 @@ class TransferMeta:
     cpu_block_ids: list[int]
 
 
+# Runtime controls a request directive may flip in every worker
+# (SimpleCPUOffloadWorker._apply_controls), with their accepted values.
+CONTROLS = {
+    "qsa_grouped_page4": ("0", "1"),
+    "qsa_grouped_pad_fix": ("0", "1"),
+    "compute_nans_in_logits": ("0", "1"),
+}
+DIRECTIVE_KEY = "simple_cpu"
+
+
+@dataclass(frozen=True)
+class Directives:
+    """The "simple_cpu" entry of a request's kv_transfer_params, honoured
+    only with options.allow_request_directives (experiments):
+      {"corrupt": "<mode>[=N]"}  damage this request's own load like
+                                 fingerprint_corrupt_plan (fingerprint
+                                 CORRUPT_MODES)
+      {"gate": true}             report the load to the scheduler only with
+                                 the fingerprint verdict; a bad verdict
+                                 fails the load (the blocks are recomputed)
+      {"control": {name: "0"|"1"}}  flip a runtime control in every worker
+                                 (CONTROLS), with or without a CPU hit
+    """
+
+    corrupt: str = ""
+    gate: bool = False
+    controls: tuple[tuple[str, str], ...] = ()
+
+
+def parse_directives(params: dict[str, Any] | None) -> Directives | None:
+    """Validate a request's kv_transfer_params["simple_cpu"]; None without
+    one. Raises ValueError on anything unknown."""
+    if not params:
+        return None
+    entry = params.get(DIRECTIVE_KEY)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError(f"kv_transfer_params[{DIRECTIVE_KEY!r}] must be an object")
+    unknown = set(entry) - {"corrupt", "gate", "control"}
+    if unknown:
+        raise ValueError(f"unknown {DIRECTIVE_KEY} directives: {sorted(unknown)}")
+    corrupt = str(entry.get("corrupt") or "")
+    if corrupt:
+        from vllm.v1.simple_kv_offload.fingerprint import parse_corrupt_mode
+
+        parse_corrupt_mode(corrupt)
+    gate = entry.get("gate", False)
+    if not isinstance(gate, bool):
+        raise ValueError(f"{DIRECTIVE_KEY}.gate must be a boolean")
+    controls: list[tuple[str, str]] = []
+    for name, value in (entry.get("control") or {}).items():
+        value = str(value)
+        if name not in CONTROLS or value not in CONTROLS[name]:
+            raise ValueError(f"{DIRECTIVE_KEY}.control {name}={value!r} is not allowed")
+        controls.append((name, value))
+    return Directives(corrupt=corrupt, gate=gate, controls=tuple(controls))
+
+
 @dataclass
 class LoadRequestState:
     request: "Request"
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
+    # Block kinds parallel to transfer_meta.gpu_block_ids (fingerprint
+    # BLOCK_ATTN / BLOCK_STATE) and the request's directives, if any.
+    kinds: list[int] = field(default_factory=list)
+    directives: Directives | None = None
     # For the admission / completion log lines.
     num_local_hit_tokens: int = 0
     num_cpu_hit_tokens: int = 0
@@ -201,6 +272,15 @@ class SimpleCPUOffloadScheduler:
         # Inverse map: load_event_idx -> req_ids. Keyed by load_event_idx because
         # the worker reports completions by event index, not request id.
         self._load_event_to_reqs: dict[int, list[str]] = {}
+        # Per pending load event (metadata.load_spans / load_corrupt /
+        # load_gate): each request's block span, the corrupt directives and
+        # whether the event is gated on the fingerprint verdict.
+        self._load_spans: dict[int, list[tuple[int, int]]] = {}
+        self._load_corrupt: dict[int, list[tuple[int, int, str]]] = {}
+        self._load_gate: dict[int, bool] = {}
+        # Runtime controls requested by directives, sent with the next step.
+        self._pending_controls: dict[str, str] = {}
+        self._gpu_block_kinds: dict[int, int] = {}
 
         # CPU hits found by get_num_new_matched_tokens(), kept pinned via
         # touch() while awaiting update_state_after_alloc().
@@ -678,6 +758,20 @@ class SimpleCPUOffloadScheduler:
         # between get_num_new_matched_tokens() and this matching call.
         pending = self._pending_cpu_hits.pop(req_id, None)
 
+        directives: Directives | None = None
+        if self.options.allow_request_directives:
+            try:
+                directives = parse_directives(request.kv_transfer_params)
+            except ValueError as err:
+                logger.warning("SimpleCPU directives req=%s rejected: %s", req_id, err)
+            if directives is not None and directives.controls:
+                self._pending_controls.update(directives.controls)
+                logger.warning(
+                    "SimpleCPU directives req=%s controls=%s",
+                    req_id,
+                    dict(directives.controls),
+                )
+
         if num_external_tokens == 0:
             if pending is not None:
                 logger.warning(
@@ -713,10 +807,12 @@ class SimpleCPUOffloadScheduler:
 
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
+        block_kinds: list[int] = []
         cpu_blocks_to_touch: list[KVCacheBlock] = []
 
         for g in range(num_groups):
             spec = kv_cache_groups[g].kv_cache_spec
+            block_kind = BLOCK_STATE if isinstance(spec, MambaSpec) else BLOCK_ATTN
             if not spec.prefix_cacheable:
                 # Per-request scratch; get_num_new_matched_tokens() refuses
                 # hits with blocks in these groups.
@@ -740,6 +836,7 @@ class SimpleCPUOffloadScheduler:
                     )
                 gpu_block_ids.append(gpu_block_id)
                 cpu_block_ids.append(cpu_blk.block_id)
+                block_kinds.append(block_kind)
                 cpu_blocks_to_touch.append(cpu_blk)
 
             if isinstance(spec, MambaSpec) and (
@@ -816,6 +913,8 @@ class SimpleCPUOffloadScheduler:
             num_cpu_hit_tokens=num_external_tokens,
             need_next=pending.need_next,
             admission=pending.admission,
+            kinds=block_kinds,
+            directives=directives,
         )
 
     def build_connector_meta(
@@ -856,17 +955,43 @@ class SimpleCPUOffloadScheduler:
         load_event = -1
         load_gpu: list[int] = []
         load_cpu: list[int] = []
+        load_kinds: list[int] = []
+        load_spans: list[tuple[int, int]] = []
+        load_corrupt: list[tuple[int, int, str]] = []
+        load_gate = False
         load_req_ids: list[str] = []
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
             assert load_state.transfer_meta is not None
+            start = len(load_gpu)
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
+            load_kinds.extend(load_state.kinds)
+            load_spans.append((start, len(load_gpu)))
+            directives = load_state.directives
+            if directives is not None:
+                if directives.corrupt:
+                    load_corrupt.append((start, len(load_gpu), directives.corrupt))
+                load_gate = load_gate or directives.gate
             load_req_ids.append(req_id)
         if load_req_ids:
             load_event = self._load_event_counter
             self._load_event_counter += 1
+            if len(load_kinds) != len(load_gpu):
+                load_kinds = []
+            self._load_spans[load_event] = load_spans
+            if load_corrupt:
+                self._load_corrupt[load_event] = load_corrupt
+            if load_gate:
+                self._load_gate[load_event] = True
+            if load_corrupt or load_gate:
+                logger.warning(
+                    "SimpleCPU load directives event=%d corrupt=%s gate=%s",
+                    load_event,
+                    load_corrupt,
+                    load_gate,
+                )
             now = self._clock()
             for req_id in load_req_ids:
                 load_state = self._reqs_to_load[req_id]
@@ -887,16 +1012,28 @@ class SimpleCPUOffloadScheduler:
                 )
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        controls = self._pending_controls
+        self._pending_controls = {}
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
             load_event_to_reqs=self._load_event_to_reqs,
+            load_block_kinds=load_kinds if self.options.fingerprint else [],
+            load_spans=self._load_spans,
+            load_corrupt=self._load_corrupt,
+            load_gate=self._load_gate,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
+            store_block_kinds=(
+                [self._block_kind(bid) for bid in store_gpu]
+                if self.options.fingerprint
+                else []
+            ),
             need_flush=bool(scheduler_output.preempted_req_ids),
             num_cpu_blocks=self.num_cpu_blocks,
+            controls=controls,
         )
 
         self._num_steps += 1
@@ -904,6 +1041,24 @@ class SimpleCPUOffloadScheduler:
         for step in [s for s in self._recently_freed if s < oldest_step]:
             del self._recently_freed[step]
         return result
+
+    def _block_kind(self, gpu_block_id: int) -> int:
+        """What a hashed GPU block's owner keeps in it (fingerprint
+        BLOCK_ATTN / BLOCK_STATE), from its hash's KV cache group."""
+        assert self._gpu_block_pool is not None
+        bhash = self._gpu_block_pool.blocks[gpu_block_id].block_hash
+        if bhash is None:
+            return BLOCK_UNKNOWN
+        group_id = get_group_id(bhash)
+        kind = self._gpu_block_kinds.get(group_id)
+        if kind is None:
+            groups = self.cpu_kv_cache_config.kv_cache_groups
+            if group_id >= len(groups):
+                return BLOCK_UNKNOWN
+            spec = groups[group_id].kv_cache_spec
+            kind = BLOCK_STATE if isinstance(spec, MambaSpec) else BLOCK_ATTN
+            self._gpu_block_kinds[group_id] = kind
+        return kind
 
     def _maybe_check_host_mem(self) -> None:
         """Sample host MemAvailable every HOST_MEM_CHECK_INTERVAL_S seconds."""
@@ -1225,6 +1380,15 @@ class SimpleCPUOffloadScheduler:
         per-event worker counts. We accumulate across steps and process
         a store event only when all workers have reported completion.
         """
+        # --- Failed loads (gated loads with a bad fingerprint verdict) ---
+        # The scheduler recomputes the affected requests from their GPU
+        # prefix; here the bad CPU copies leave the CPU prefix cache and the
+        # GPU blocks forget that they were offloaded, so the recomputed
+        # blocks can be stored again.
+        invalid = connector_output.invalid_block_ids
+        if invalid:
+            self._fail_loads(invalid)
+
         # --- Load completions ---
         for req_id in list(connector_output.finished_recving or []):
             load_state = self._reqs_to_load.get(req_id)
@@ -1249,6 +1413,37 @@ class SimpleCPUOffloadScheduler:
                 self._process_store_event(event_idx)
             else:
                 self._store_event_pending_counts[event_idx] = total
+
+    def _fail_loads(self, invalid_gpu_block_ids: set[int]) -> None:
+        """GPU blocks of in-flight loads that the worker reported as failed
+        (metadata.load_gate): evict their CPU copies from the CPU prefix
+        cache and drop the offloaded mark of every GPU block of the affected
+        requests."""
+        for req_id, state in self._reqs_to_load.items():
+            meta = state.transfer_meta
+            bad = [
+                (gid, cid)
+                for gid, cid in zip(meta.gpu_block_ids, meta.cpu_block_ids)
+                if gid in invalid_gpu_block_ids
+            ]
+            if not bad:
+                continue
+            self.cpu_block_pool.evict_blocks({cid for _, cid in bad})
+            for gid in meta.gpu_block_ids:
+                self._gpu_offloaded.pop(gid, None)
+            self._stats.add(LOAD_FAILED_REQUESTS)
+            self._stats.add(LOAD_FAILED_BLOCKS, len(bad))
+            logger.warning(
+                "SimpleCPU load FAILED req=%s event=%s: %d of %d blocks bad; "
+                "CPU blocks %s evicted from the tier, the request recomputes "
+                "from its GPU prefix (%d tokens)",
+                req_id,
+                state.load_event,
+                len(bad),
+                len(meta.gpu_block_ids),
+                _ranges([cid for _, cid in bad]),
+                state.num_local_hit_tokens,
+            )
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
@@ -1470,6 +1665,9 @@ class SimpleCPUOffloadScheduler:
                     reqs.remove(req_id)
                 if not reqs:
                     self._load_event_to_reqs.pop(state.load_event, None)
+                    self._load_spans.pop(state.load_event, None)
+                    self._load_corrupt.pop(state.load_event, None)
+                    self._load_gate.pop(state.load_event, None)
 
         if state.transfer_meta is not None:
             # Free CPU touch refs, prefix head last (most recent in the LRU).

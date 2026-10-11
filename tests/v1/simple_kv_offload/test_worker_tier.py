@@ -149,7 +149,10 @@ def _drive(
             return
         assert time.monotonic() < deadline, (got_recv, got_stores)
         metadata = SimpleCPUOffloadMetadata(
-            load_event_to_reqs=metadata.load_event_to_reqs
+            load_event_to_reqs=metadata.load_event_to_reqs,
+            load_spans=metadata.load_spans,
+            load_corrupt=metadata.load_corrupt,
+            load_gate=metadata.load_gate,
         )
         time.sleep(0.001)
 
@@ -795,3 +798,178 @@ def test_stats_aggregate_over_ranks() -> None:
     assert reduced["load_events"] == 4
     assert reduced["load_dma_ms_max"] == 4.0
     assert reduced["load_ready_ms_avg"] == pytest.approx(25.0)
+
+
+# --- Fingerprint gate: a load with a bad verdict is reported as failed ---
+
+from vllm.v1.simple_kv_offload.fingerprint import BLOCK_ATTN, BLOCK_STATE  # noqa: E402
+
+_KINDS = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+
+
+def _fill_finite(worker: SimpleCPUOffloadWorker) -> None:
+    """Random finite content in the typed views of every region."""
+    assert worker.gpu_kv_caches is not None and worker.cpu_kv_caches is not None
+    for caches in (worker.gpu_kv_caches, worker.cpu_kv_caches):
+        for name, t in caches.items():
+            dtype = torch.float32 if name.startswith("mamba") else torch.float16
+            t.view(dtype).uniform_(-1, 1)
+
+
+def _gated_round_trip(
+    worker: SimpleCPUOffloadWorker, damage: Callable[[], None] | None = None
+) -> set[int]:
+    """Store three blocks (two attention, one state), damage the CPU side,
+    load them back under the gate for two requests ("a" owns the first
+    block, "b" the other two) and return the reported invalid blocks."""
+    with torch.inference_mode():
+        _fill_finite(worker)
+        _drive(
+            worker,
+            SimpleCPUOffloadMetadata(
+                store_event=0,
+                store_gpu_blocks=[1, 4, 7],
+                store_cpu_blocks=[5, 0, 2],
+                store_block_kinds=_KINDS,
+                num_cpu_blocks=NUM_CPU_BLOCKS,
+            ),
+            stores=(0,),
+        )
+        # Let the checker finish with the store before the CPU side is
+        # damaged, so the damage is named at the load (cpu-at-rest), not as
+        # a store that missed the CPU.
+        assert worker._fp is not None
+        deadline = time.monotonic() + 10
+        while worker._fp.counters["stores"] < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        if damage is not None:
+            damage()
+        _drive(
+            worker,
+            SimpleCPUOffloadMetadata(
+                load_event=0,
+                load_cpu_blocks=[5, 0, 2],
+                load_gpu_blocks=[3, 6, 0],
+                load_event_to_reqs={0: ["a", "b"]},
+                load_block_kinds=_KINDS,
+                load_spans={0: [(0, 1), (1, 3)]},
+                load_gate={0: True},
+                num_cpu_blocks=NUM_CPU_BLOCKS,
+            ),
+            recv=("a", "b"),
+        )
+        invalid = worker.get_block_ids_with_load_errors()
+        for _ in range(9):
+            _step(worker, SimpleCPUOffloadMetadata())
+    torch.accelerator.synchronize()
+    assert worker._fp is not None
+    worker._fp.close()
+    worker._fp._thread.join(30)
+    return invalid
+
+
+def test_gate_passes_a_faithful_load(make_worker) -> None:
+    worker = make_worker(fingerprint=True)
+    assert _gated_round_trip(worker) == set()
+    assert worker.get_block_ids_with_load_errors() == set()
+    fp = worker._fp
+    assert fp.counters["loads"] == 1 and fp.counters["mismatch_events"] == 0
+    assert fp.counters["nonfinite_events"] == 0, fp.reports
+    assert not worker._gated_loads
+
+
+def test_gate_fails_the_request_whose_block_carries_non_finite_values(
+    make_worker,
+) -> None:
+    worker = make_worker(fingerprint=True)
+
+    def nan_in_v_of_cpu_block_0() -> None:
+        # CPU block 0 restores into GPU block 6, request "b"'s first block.
+        worker.cpu_kv_caches["attn.0.1"].view(torch.float16)[0, 3] = float("nan")
+
+    assert _gated_round_trip(worker, nan_in_v_of_cpu_block_0) == {6, 0}
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert "nonfinite load restored(gpu after copy)" in worker._fp.reports
+    assert "nonfinite load cpu-at-launch" in worker._fp.reports
+    # The CPU block changed after its store: named as well.
+    assert "load cpu-at-rest" in worker._fp.reports
+    assert "load cpu->gpu" not in worker._fp.reports
+
+
+def test_gate_fails_the_request_whose_block_differs_from_its_cpu_copy(
+    make_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = make_worker(fingerprint=True)
+    real_copy = DmaCopyBackend._copy
+    calls = []
+
+    def copy(src_blocks, dst_blocks, params):
+        calls.append(1)
+        if len(calls) == 2:  # the load: CPU block 5 lands in every destination
+            src_blocks = [src_blocks[0]] * len(src_blocks)
+        real_copy(src_blocks, dst_blocks, params)
+
+    monkeypatch.setattr(DmaCopyBackend, "_copy", staticmethod(copy))
+    assert _gated_round_trip(worker) == {6, 0}
+    assert "load cpu->gpu" in worker._fp.reports
+
+
+def test_gate_holds_the_load_until_the_verdict_arrives(make_worker) -> None:
+    worker = make_worker(fingerprint=True, fingerprint_gate_timeout_s=30.0)
+    fp = worker._fp
+    real_pop = fp.pop_load_verdict
+    polls: list[int] = []
+
+    def pop(event_idx: int):
+        polls.append(event_idx)
+        return None if len(polls) < 4 else real_pop(event_idx)
+
+    fp.pop_load_verdict = pop  # type: ignore[method-assign]
+    assert _gated_round_trip(worker) == set()
+    assert len(polls) >= 4
+
+
+def test_gate_times_out_into_a_clean_load(make_worker) -> None:
+    worker = make_worker(fingerprint=True, fingerprint_gate_timeout_s=0.0)
+    fp = worker._fp
+    fp.pop_load_verdict = lambda event_idx: None  # type: ignore[method-assign]
+    assert _gated_round_trip(worker) == set()
+    assert not worker._gated_loads
+
+
+def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
+    worker = _mock_worker()
+    applied: list[tuple[str, str]] = []
+
+    class FakeQSA:
+        _SM70_QSA_GROUPED_PAGE4 = True
+        _SM70_QSA_GROUPED_PAD_FIX = True
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "vllm.models.qwen4_exp.nvidia.ops.qsa", FakeQSA)
+    monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0")
+    meta = SimpleCPUOffloadMetadata(
+        controls={"qsa_grouped_page4": "0", "compute_nans_in_logits": "1", "x": "1"}
+    )
+    worker.bind_connector_metadata(meta)
+    worker.clear_connector_metadata()
+    assert FakeQSA._SM70_QSA_GROUPED_PAGE4 is False
+    import os
+
+    assert os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] == "1"
+    assert worker._controls == {"qsa_grouped_page4": "0", "compute_nans_in_logits": "1"}
+    FakeQSA._SM70_QSA_GROUPED_PAGE4 = True  # the same value again is a no-op
+    worker.bind_connector_metadata(
+        SimpleCPUOffloadMetadata(controls={"qsa_grouped_page4": "0"})
+    )
+    assert FakeQSA._SM70_QSA_GROUPED_PAGE4 is True
+    worker.bind_connector_metadata(
+        SimpleCPUOffloadMetadata(controls={"qsa_grouped_page4": "1"})
+    )
+    assert (
+        FakeQSA._SM70_QSA_GROUPED_PAGE4 is True
+        and worker._controls["qsa_grouped_page4"] == "1"
+    )
+    del applied

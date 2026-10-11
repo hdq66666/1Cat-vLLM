@@ -121,6 +121,7 @@ def _make_scheduler() -> Scheduler:
         kv_transfer_config=KVTransferConfig(
             kv_connector="SimpleCPUOffloadConnector",
             kv_role="kv_both",
+            kv_load_failure_policy="recompute",
             kv_connector_extra_config={
                 # Twice the GPU pool, so nothing is evicted from the CPU tier.
                 "cpu_bytes_to_use": 2 * gpu_bytes,
@@ -158,7 +159,9 @@ def _make_request(request_id: str, prompt_token_ids: list[int]) -> Request:
 
 
 def _step(
-    scheduler: Scheduler, finished_recving: set[str] | None = None
+    scheduler: Scheduler,
+    finished_recving: set[str] | None = None,
+    invalid_block_ids: set[int] | None = None,
 ) -> tuple[SchedulerOutput, SimpleCPUOffloadMetadata]:
     """One engine step with an instant worker: this step's store completes
     and partial prefills sample nothing."""
@@ -188,6 +191,7 @@ def _step(
             kv_connector_output=KVConnectorOutput(
                 finished_sending=set(),
                 finished_recving=finished_recving or set(),
+                invalid_block_ids=invalid_block_ids or set(),
                 kv_connector_worker_meta=worker_meta,
             ),
         ),
@@ -359,3 +363,125 @@ def test_new_block_ids_are_drained_without_zeroing() -> None:
     assert output.new_block_ids_to_zero is None
     for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
         assert manager.new_block_ids == []
+
+
+# --- Failed loads on the hybrid layout (fingerprint gate) ---
+
+from vllm.v1.simple_kv_offload.fingerprint import BLOCK_STATE  # noqa: E402
+from vllm.v1.simple_kv_offload.stats import (  # noqa: E402
+    LOAD_FAILED_BLOCKS,
+    LOAD_FAILED_REQUESTS,
+)
+
+
+@pytest.mark.parametrize("which", ["state_block", "every_block"])
+def test_failed_async_load_on_hybrid_layout_recomputes_the_prompt(which: str) -> None:
+    """The worker reports loaded blocks as failed (a bad fingerprint verdict
+    on a gated load): the scheduler truncates the request to its GPU prefix
+    across every KV cache group, the bad CPU copies leave the tier, and the
+    request is prefilled again without the bad blocks."""
+    scheduler = _make_scheduler()
+    assert scheduler.recompute_kv_load_failures
+    _, meta, repeat, _ = _admit_cpu_hit_with_fresh_request(scheduler)
+    manager = scheduler.connector.scheduler_manager
+    state = manager._reqs_to_load["B"]
+    loaded_gpu = list(state.transfer_meta.gpu_block_ids)
+    assert loaded_gpu == meta.load_gpu_blocks and len(state.kinds) == len(loaded_gpu)
+    assert meta.load_spans == {meta.load_event: [(0, len(loaded_gpu))]}
+    assert all(gid in manager._gpu_offloaded for gid in loaded_gpu)
+    state_blocks = [g for g, k in zip(loaded_gpu, state.kinds) if k == BLOCK_STATE]
+    assert state_blocks, "the load carries no Mamba state block"
+    mamba_group = len(scheduler.kv_cache_config.kv_cache_groups) - 1
+    mamba_blocks = _req_block_ids(scheduler, mamba_group, "B")
+    if which == "every_block":
+        invalid = set(loaded_gpu)
+        expected = 0  # no GPU prefix: nothing is kept
+    else:
+        # Only the last state block is bad: the request resumes from the
+        # last real state block before it (a null entry holds no state).
+        invalid = {state_blocks[-1]}
+        idx = mamba_blocks.index(state_blocks[-1])
+        real = [j for j in range(idx) if mamba_blocks[j] != 0]
+        expected = (real[-1] + 1) * MAMBA_BLOCK if real else 0
+        assert expected < CPU_HIT_TOKENS
+
+    # The load completes with a bad verdict.
+    _step(scheduler, finished_recving={"B"}, invalid_block_ids=invalid)
+    assert repeat.num_computed_tokens == expected
+    assert not any(gid in manager._gpu_offloaded for gid in loaded_gpu)
+    assert manager._stats.data[LOAD_FAILED_REQUESTS] == 1
+    assert manager._stats.data[LOAD_FAILED_BLOCKS] == len(invalid)
+    assert "B" not in manager._reqs_to_load
+    # The bad CPU blocks are no longer served.
+    _, hit_tokens = manager.cpu_coordinator.find_longest_cache_hit(
+        repeat.block_hashes, repeat.num_tokens - 1
+    )
+    if which == "every_block":
+        assert hit_tokens == 0, hit_tokens
+    else:
+        assert hit_tokens < CPU_HIT_TOKENS, hit_tokens
+
+    # The request runs to the end; with nothing left on the CPU side there
+    # is no second load.
+    for _ in range(PROMPT_LEN + 8):
+        _, meta = _step(scheduler)
+        if which == "every_block":
+            assert meta.load_event < 0
+        if "B" not in scheduler.requests:
+            break
+    assert "B" not in scheduler.requests and repeat.is_finished()
+    assert repeat.num_computed_tokens >= PROMPT_LEN
+    # Its freed blocks are stored again (the offloaded marks were dropped).
+    for _ in range(4):
+        _step(scheduler)
+    _, hit_tokens = manager.cpu_coordinator.find_longest_cache_hit(
+        repeat.block_hashes, repeat.num_tokens - 1
+    )
+    assert hit_tokens == CPU_HIT_TOKENS
+
+
+def test_invalid_blocks_truncate_to_the_shortest_valid_prefix_across_groups() -> None:
+    """_update_requests_with_invalid_blocks on several KV cache groups: the
+    computed prefix becomes the minimum over the groups of the first invalid
+    block's start, and every group's downstream blocks are evicted."""
+    scheduler = _make_scheduler()
+    prompt = list(range(2000, 2000 + PROMPT_LEN))
+    scheduler.add_request(_make_request("D", prompt))
+    for _ in range(2):
+        _step(scheduler)
+    request = scheduler.requests["D"]
+    computed = request.num_computed_tokens
+    fa_blocks = _req_block_ids(scheduler, FA_GROUP, "D")
+    mamba_group = len(scheduler.kv_cache_config.kv_cache_groups) - 1
+    mamba_blocks = _req_block_ids(scheduler, mamba_group, "D")
+    # A live (non-null) Mamba state block with a full-attention block after
+    # its start and before the computed end.
+    live = [
+        i
+        for i, b in enumerate(mamba_blocks)
+        if b != 0 and i * MAMBA_BLOCK + FA_BLOCK < computed
+    ]
+    assert live, (mamba_blocks, computed)
+    idx_m = live[-1]
+    start = idx_m * MAMBA_BLOCK
+    idx_f = start // FA_BLOCK + 1
+    assert fa_blocks[idx_f] != 0
+
+    invalid = {fa_blocks[idx_f], mamba_blocks[idx_m]}
+    affected, tokens, evict = scheduler._update_requests_with_invalid_blocks(
+        [request], invalid, {}, evict_blocks=True
+    )
+    assert affected == {"D"} and request.num_computed_tokens == start
+    assert tokens == computed - start
+    assert set(fa_blocks[idx_f:]) <= evict and set(mamba_blocks[idx_m:]) <= evict
+    assert fa_blocks[idx_f - 1] not in evict
+
+    # Only the full-attention block invalid: the cut lands after the state
+    # block's start and the Mamba blocks stay.
+    request.num_computed_tokens = computed
+    affected, tokens, evict = scheduler._update_requests_with_invalid_blocks(
+        [request], {fa_blocks[idx_f]}, {}, evict_blocks=True
+    )
+    assert affected == {"D"} and request.num_computed_tokens == start + FA_BLOCK
+    assert tokens == computed - start - FA_BLOCK
+    assert set(fa_blocks[idx_f:]) <= evict and not set(mamba_blocks) & evict

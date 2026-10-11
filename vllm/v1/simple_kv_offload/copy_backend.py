@@ -196,16 +196,23 @@ class DmaCopyBackend:
                 stream = store_stream if is_store else load_stream
                 fp = self.fp
                 pre = fp.snapshot(stream) if fp is not None and is_store else None
+                # Non-finite counts of the GPU side: the source before a
+                # store, the destination after a load.
+                nonfinite = None
+                if fp is not None and is_store:
+                    nonfinite = fp.nonfinite(stream, (True, event_idx))
                 start = torch.Event(enable_timing=True)
                 start.record(stream)
                 self._copy(src_blocks, dst_blocks, params)
                 # The post-copy checksums are part of the transfer: the copy
                 # is reported complete only after they were taken.
                 post = fp.snapshot(stream) if fp is not None else None
+                if fp is not None and not is_store:
+                    nonfinite = fp.nonfinite(stream, (False, event_idx))
                 done = torch.Event(enable_timing=True)
                 done.record(stream)
                 if fp is not None:
-                    fp.transfer_issued(is_store, event_idx, pre, post, done)
+                    fp.transfer_issued(is_store, event_idx, pre, post, done, nonfinite)
                 events_list.append(TransferEvent(event_idx, start, done))
                 # Count the copy only once its event is visible to the worker.
                 with self._cond:

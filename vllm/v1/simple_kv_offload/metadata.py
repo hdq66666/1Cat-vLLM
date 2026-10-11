@@ -28,11 +28,28 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_cpu_blocks: list[int] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
+    # What each loaded block's owner keeps in it (fingerprint.BLOCK_ATTN /
+    # BLOCK_STATE / BLOCK_UNKNOWN), parallel to load_gpu_blocks; empty when
+    # the fingerprint chain is off.
+    load_block_kinds: list[int] = field(default_factory=list)
+    # Per load event, kept while the event is pending like
+    # load_event_to_reqs: the [start, end) span of each request's blocks in
+    # the event's block list (same order as load_event_to_reqs), the
+    # corrupt directives (start, end, mode) and whether any request asked
+    # for the load to be gated on the fingerprint verdict.
+    load_spans: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    load_corrupt: dict[int, list[tuple[int, int, str]]] = field(default_factory=dict)
+    load_gate: dict[int, bool] = field(default_factory=dict)
 
     # Store event per step. INVALID_JOB_ID means no blocks to store this step.
     store_event: int = INVALID_JOB_ID
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)
+    store_block_kinds: list[int] = field(default_factory=list)
+
+    # Runtime controls requested through request directives this step
+    # (options.allow_request_directives); applied by every worker.
+    controls: dict[str, str] = field(default_factory=dict)
 
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
