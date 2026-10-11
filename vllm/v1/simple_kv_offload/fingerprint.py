@@ -65,6 +65,24 @@ class Snapshot:
         return self.host
 
 
+CORRUPT_MODES = ("zero_fa", "zero_state", "nan_fa", "swap_fa")
+
+
+def parse_corrupt_plan(plan: str) -> dict[int, str]:
+    """"5:zero_state=4;21:zero_fa=8;37:nan_fa=1;53:swap_fa=8" -> {load
+    number (1-based): mode}. zero_fa=N zeroes the first N loaded blocks,
+    zero_state=N the last N (the state blocks), nan_fa=N fills the first N
+    with all-ones bits, swap_fa=N overwrites the first N with other blocks of
+    the same load."""
+    out: dict[int, str] = {}
+    for item in filter(None, (part.strip() for part in plan.split(";"))):
+        number, _, mode = item.partition(":")
+        if mode.partition("=")[0] not in CORRUPT_MODES:
+            raise ValueError(f"unknown corrupt mode {mode!r} in {plan!r}")
+        out[int(number)] = mode
+    return out
+
+
 def _digest(values: torch.Tensor) -> int:
     return int(values.sum().item()) & 0xFFFFFFFFFFFFFFFF
 
@@ -77,6 +95,7 @@ class FingerprintChain:
         rank: int,
         inject_gpu_load: int = 0,
         inject_cpu_load: int = 0,
+        corrupt_plan: str = "",
         start_thread: bool = True,
     ) -> None:
         self.rank = rank
@@ -90,6 +109,11 @@ class FingerprintChain:
         self._inject_gpu_load = inject_gpu_load
         self._inject_cpu_load = inject_cpu_load
         self._inject_event = -1
+        # Fault injection for experiments: {load number: mode}, see
+        # parse_corrupt_plan(). Applied on the compute stream when the load
+        # is seen complete, i.e. before the request's first step.
+        self._corrupt_plan = parse_corrupt_plan(corrupt_plan)
+        self._corrupt_event: dict[int, str] = {}
 
         # Main thread only.
         self._step = 0
@@ -192,6 +216,9 @@ class FingerprintChain:
         self._load_blocks[event_idx] = list(gpu_ids)
         if self._num_loads == self._inject_gpu_load:
             self._inject_event = event_idx
+        mode = self._corrupt_plan.get(self._num_loads)
+        if mode is not None:
+            self._corrupt_event[event_idx] = mode
         if self._num_loads == self._inject_cpu_load:
             # Positive control: change one word of the first CPU block.
             self._cpu[0][cpu_ids[0], 0] ^= 1
@@ -218,6 +245,36 @@ class FingerprintChain:
             # Positive control: change one word of the first loaded GPU block
             # after the step-0 check, so the later checks must report it.
             self._watches.setdefault(self._step, []).append((event_idx, -1, gpu_ids))
+        mode = self._corrupt_event.pop(event_idx, None)
+        if mode is not None:
+            self._corrupt(mode, event_idx, gpu_ids)
+
+    def _corrupt(self, mode: str, event_idx: int, gpu_ids: list[int]) -> None:
+        """Deliberately damage loaded blocks (corrupt_plan). The load list is
+        the full-attention blocks in prompt order followed by one state block
+        per state-space group."""
+        kind, _, arg = mode.partition("=")
+        count = int(arg) if arg else 1
+        if kind == "zero_state":
+            targets = gpu_ids[-count:]
+        else:
+            targets = gpu_ids[:count]
+        for region in self._gpu:
+            for i, gid in enumerate(targets):
+                if kind in ("zero_fa", "zero_state"):
+                    region[gid].zero_()
+                elif kind == "nan_fa":
+                    region[gid].fill_(-1)  # all bits set: NaN in fp16/fp32
+                elif kind == "swap_fa":
+                    # Another block of the same request: finite, wrong content.
+                    region[gid].copy_(region[gpu_ids[len(gpu_ids) // 2 + i]])
+        logger.warning(
+            "SimpleCPU fp CORRUPT %s rank=%d load event=%d gpu=%s",
+            mode,
+            self.rank,
+            event_idx,
+            targets,
+        )
 
     def tick(self, stream: Any) -> None:
         """Once per engine step, after the step's transfers were submitted."""

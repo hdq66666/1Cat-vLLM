@@ -338,6 +338,7 @@ class SimpleCPUOffloadWorker:
                     rank,
                     inject_gpu_load=self.options.fingerprint_inject_gpu_load,
                     inject_cpu_load=self.options.fingerprint_inject_cpu_load,
+                    corrupt_plan=self.options.fingerprint_corrupt_plan,
                 )
                 self._backend.fp = self._fp
             except Exception:
