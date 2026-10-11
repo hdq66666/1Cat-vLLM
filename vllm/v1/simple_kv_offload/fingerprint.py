@@ -98,7 +98,11 @@ class Snapshot:
 # load (all regions), zero_state=N / nan_state=N on its last N state blocks.
 # nan_v=N / inf_v=N / nan_k=N act only on the V (K) part of the first N
 # attention blocks, nan_v_tail=N / nan_k_tail=N on the last N: keys stay
-# valid, so the selected pages read non-finite values.
+# valid, so the selected pages read non-finite values. These act on the GPU
+# blocks once the load completed, i.e. after the chain's load checks: they
+# test the model, not the gate. The cpu_* modes damage the CPU rows at the
+# load's launch, before the copy, so the chain sees the damage at the load
+# (cpu-at-rest, cpu-at-launch, restored) and a gated load fails on it.
 CORRUPT_MODES = (
     "zero_fa",
     "zero_state",
@@ -110,6 +114,12 @@ CORRUPT_MODES = (
     "inf_v",
     "nan_k",
     "nan_k_tail",
+    "cpu_zero_fa",
+    "cpu_nan_fa",
+    "cpu_nan_v",
+    "cpu_nan_v_tail",
+    "cpu_nan_k",
+    "cpu_nan_state",
 )
 _PART_MODES = {
     "nan_v": "v",
@@ -117,6 +127,9 @@ _PART_MODES = {
     "inf_v": "v",
     "nan_k": "k",
     "nan_k_tail": "k",
+    "cpu_nan_v": "v",
+    "cpu_nan_v_tail": "v",
+    "cpu_nan_k": "k",
 }
 
 
@@ -444,7 +457,8 @@ class FingerprintChain:
         corrupt: list[tuple[int, int, str]] | None = None,
     ) -> None:
         """corrupt: (start, end, mode) spans of the load's block list to
-        damage once the load is seen complete (see CORRUPT_MODES)."""
+        damage: cpu_* modes now, on the CPU rows before the copy; the others
+        on the GPU blocks once the load is seen complete (CORRUPT_MODES)."""
         self._num_loads += 1
         self._load_blocks[event_idx] = (list(gpu_ids), kinds)
         self._event_blocks[(False, event_idx)] = (list(gpu_ids), kinds)
@@ -454,8 +468,19 @@ class FingerprintChain:
         mode = self._corrupt_plan.get(self._num_loads)
         if mode is not None:
             spans.append((0, len(gpu_ids), mode))
-        if spans:
-            self._corrupt_event[event_idx] = spans
+        later = []
+        for start, end, mode in spans:
+            if mode.startswith("cpu_"):
+                self._corrupt(
+                    mode,
+                    event_idx,
+                    cpu_ids[start:end],
+                    kinds[start:end] if kinds is not None else None,
+                )
+            else:
+                later.append((start, end, mode))
+        if later:
+            self._corrupt_event[event_idx] = later
         if self._num_loads == self._inject_cpu_load:
             # Positive control: change one word of the first CPU block.
             self._cpu[0][cpu_ids[0], 0] ^= 1
@@ -499,10 +524,15 @@ class FingerprintChain:
         kinds: list[int] | None,
     ) -> None:
         """Deliberately damage loaded blocks (corrupt plans and request
-        directives). Without block kinds the load list is taken as the
+        directives): the GPU blocks gpu_ids, or for cpu_* modes the CPU rows
+        passed as gpu_ids. Without block kinds the load list is taken as the
         full-attention blocks in prompt order followed by the state blocks."""
         kind, count = parse_corrupt_mode(mode)
         part = _PART_MODES.get(kind)
+        on_cpu = kind.startswith("cpu_")
+        if on_cpu:
+            kind = kind[4:]
+        regions = self._cpu if on_cpu else self._gpu
         if kinds is None and (part is not None or kind.endswith("_tail")):
             logger.warning(
                 "SimpleCPU fp CORRUPT %s rank=%d load event=%d: needs block "
@@ -526,7 +556,7 @@ class FingerprintChain:
             targets = attn[:count]
         value = float("inf") if kind == "inf_v" else float("nan")
         touched = 0
-        for r, region in enumerate(self._gpu):
+        for r, region in enumerate(regions):
             for i, gid in enumerate(targets):
                 if kind in ("zero_fa", "zero_state"):
                     region[gid].zero_()
@@ -540,8 +570,9 @@ class FingerprintChain:
                     other = gpu_ids[(len(gpu_ids) // 2 + i) % len(gpu_ids)]
                     region[gid].copy_(region[other])
                 else:
-                    for p, view, _ in self._parts[r]:
-                        if p == part:
+                    for p, gview, cview in self._parts[r]:
+                        view = cview if on_cpu else gview
+                        if p == part and view is not None:
                             view[gid].fill_(value)
                             touched += 1
         if part is not None and not touched:
@@ -555,10 +586,11 @@ class FingerprintChain:
             )
             return
         logger.warning(
-            "SimpleCPU fp CORRUPT %s rank=%d load event=%d gpu=%s",
+            "SimpleCPU fp CORRUPT %s rank=%d load event=%d %s=%s",
             mode,
             self.rank,
             event_idx,
+            "cpu" if on_cpu else "gpu",
             targets,
         )
 

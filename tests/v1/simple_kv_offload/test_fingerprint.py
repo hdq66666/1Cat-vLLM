@@ -619,3 +619,42 @@ def test_regions_are_counted_for_their_own_group_only():
     chain.load_seen_complete(0)
     assert torch.isnan(gv["fa"][1][1][4]).all()
     assert torch.isfinite(gv["fa"][1][1][5]).all()
+
+
+@pytest.mark.parametrize(
+    "mode,positions",
+    [
+        ("cpu_nan_v=1", [0]),
+        ("cpu_nan_v_tail=1", [1]),
+        ("cpu_zero_fa=2", [0, 1]),
+        ("cpu_nan_state", [2]),
+    ],
+)
+def test_cpu_corrupt_modes_damage_the_rows_before_the_copy(mode, positions):
+    """cpu_* modes act on the CPU rows at launch: the load checks see the
+    damage (cpu-at-rest and, for NaN, cpu-at-launch / restored) and the
+    verdict names the positions, so a gated load fails on them."""
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+    _store_typed(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9], kinds)
+    chain.drain()
+    before = {name: t.clone() for name, t in cpu.items()}
+    _load_typed(chain, gpu, cpu, 0, [7, 8, 9], [1, 2, 6], kinds, corrupt=[(0, 3, mode)])
+    chain.drain()
+    assert chain.pop_load_verdict(0) == positions
+    assert "load cpu-at-rest" in chain.reports
+    if "nan" in mode:
+        assert "nonfinite load cpu-at-launch" in chain.reports
+        assert "nonfinite load restored(gpu after copy)" in chain.reports
+    # Only the chosen rows changed, and nothing waits for load completion.
+    cpu_ids = [7, 8, 9]
+    for i, cid in enumerate(cpu_ids):
+        changed = any(not torch.equal(cpu[n][cid], before[n][cid]) for n in cpu)
+        assert changed == (i in positions), (mode, i)
+    if mode.startswith("cpu_nan_v"):
+        assert torch.isnan(cv["fa"][1][1][cpu_ids[positions[0]]]).all()
+        assert torch.isfinite(cv["fa"][0][1][cpu_ids[positions[0]]]).all()
+    assert not chain._corrupt_event
+    chain.load_seen_complete(0)
+    _steps(chain, 1)
+    assert "watch +0 steps" not in chain.reports  # nothing damaged after the load

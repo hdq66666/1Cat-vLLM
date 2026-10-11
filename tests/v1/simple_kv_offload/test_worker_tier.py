@@ -817,7 +817,9 @@ def _fill_finite(worker: SimpleCPUOffloadWorker) -> None:
 
 
 def _gated_round_trip(
-    worker: SimpleCPUOffloadWorker, damage: Callable[[], None] | None = None
+    worker: SimpleCPUOffloadWorker,
+    damage: Callable[[], None] | None = None,
+    corrupt: list[tuple[int, int, str]] | None = None,
 ) -> set[int]:
     """Store three blocks (two attention, one state), damage the CPU side,
     load them back under the gate for two requests ("a" owns the first
@@ -854,6 +856,7 @@ def _gated_round_trip(
                 load_event_to_reqs={0: ["a", "b"]},
                 load_block_kinds=_KINDS,
                 load_spans={0: [(0, 1), (1, 3)]},
+                load_corrupt={0: corrupt} if corrupt else {},
                 load_gate={0: True},
                 num_cpu_blocks=NUM_CPU_BLOCKS,
             ),
@@ -983,3 +986,14 @@ def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
     )
     assert "grouped_page4_calls=7" in worker._control_status()
     del applied
+
+
+def test_gate_fails_a_load_damaged_by_a_cpu_corrupt_directive(make_worker) -> None:
+    """The runbook's gate check: a cpu_* corrupt directive on request "b"
+    damages its CPU rows before the copy, the gate fails exactly "b"."""
+    worker = make_worker(fingerprint=True)
+    assert _gated_round_trip(worker, corrupt=[(1, 3, "cpu_nan_v=1")]) == {6, 0}
+    reports = worker._fp.reports
+    assert "load cpu-at-rest" in reports
+    assert "nonfinite load restored(gpu after copy)" in reports
+    assert "load cpu->gpu" not in reports
