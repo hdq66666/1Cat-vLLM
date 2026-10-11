@@ -2658,54 +2658,84 @@ class Scheduler(SchedulerInterface):
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
+        group_specs = [
+            group.kv_cache_spec for group in self.kv_cache_config.kv_cache_groups
+        ]
+        group_block_sizes = [spec.block_size for spec in group_specs] or [
+            self.block_size
+        ]
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # One block list per KV cache group (hybrid models have several,
+            # with their own block sizes). An invalid block in any group
+            # truncates the computed prefix to the shortest valid prefix
+            # across all groups.
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            valid_tokens = req_num_computed_tokens
+            for g, (group_block_size, req_block_ids) in enumerate(
+                zip(group_block_sizes, block_ids_by_group)
+            ):
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + group_block_size - 1
+                ) // group_block_size
+                is_state_group = g < len(group_specs) and isinstance(
+                    group_specs[g], MambaSpec
                 )
-                total_affected_tokens += num_affected_tokens
+                group_marked = False
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+                    if block_id not in invalid_block_ids:
+                        continue
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    is_affected = True
+
+                    if block_id in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this
+                        # block as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
+
+                    marked_invalid_block_ids.add(block_id)
+
+                    if group_marked:
+                        # This group already marked an invalid block for
+                        # recomputation and set the truncation point.
+                        continue
+
+                    group_marked = marked_invalid_block = True
+                    # Truncate the computed tokens at the first failed block
+                    # of this group. A state-space group resumes from the
+                    # state kept in a block, so the cut must land at the end
+                    # of the last real (non-null) state block before the
+                    # failed one; null entries hold no state.
+                    if is_state_group:
+                        cut = 0
+                        for j in range(idx - 1, -1, -1):
+                            if req_block_ids[j] != null_block_id:
+                                cut = (j + 1) * group_block_size
+                                break
+                    else:
+                        cut = idx * group_block_size
+                    valid_tokens = min(valid_tokens, cut)
+
+                    # collect invalid block and all downstream dependent blocks
+                    if evict_blocks:
+                        blocks_to_evict.update(req_block_ids[idx:])
+
+            if marked_invalid_block:
+                request.num_computed_tokens = valid_tokens
+                total_affected_tokens += req_num_computed_tokens - valid_tokens
 
             if is_affected:
                 if not marked_invalid_block:

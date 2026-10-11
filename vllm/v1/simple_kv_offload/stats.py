@@ -49,6 +49,9 @@ CPU_HITS_REFUSED = "cpu_hits_refused"
 # blocks the lazy walk skipped under freed_block_quarantine_steps, and the
 # allocations the quarantine could not honour.
 LOAD_DST_YOUNG = "load_dst_young_blocks"
+# Gated loads failed on the fingerprint verdict (recomputed by the scheduler).
+LOAD_FAILED_REQUESTS = "load_failed_requests"
+LOAD_FAILED_BLOCKS = "load_failed_blocks"
 QUARANTINE_SKIPPED = "store_quarantine_skipped_blocks"
 QUARANTINE_FALLBACKS_LAST = "alloc_quarantine_fallback_blocks_last"
 # Steps in which a CPU hit was deferred for lack of GPU pool headroom, the

@@ -163,6 +163,16 @@ class SimpleCPUOffloadWorker:
         self._probe_disabled = False
         # Diagnostic fingerprint chain (options.fingerprint).
         self._fp: FingerprintChain | None = None
+        # Gated loads (request directive "gate"): event -> (deadline on the
+        # worker clock by which the chain's verdict must have arrived, GPU
+        # blocks); a completed gated load is reported to the scheduler only
+        # with its verdict.
+        self._gated_loads: dict[int, tuple[float, list[int]]] = {}
+        # GPU blocks of failed gated loads, reported once through
+        # get_block_ids_with_load_errors().
+        self._invalid_block_ids: set[int] = set()
+        # Runtime controls applied through request directives, name -> value.
+        self._controls: dict[str, str] = {}
 
     def register_kv_caches(
         self,
@@ -332,6 +342,7 @@ class SimpleCPUOffloadWorker:
         )
         if self.options.fingerprint:
             try:
+                gpu_views, cpu_views = self._typed_views(kv_caches, seen_ptrs)
                 self._fp = FingerprintChain(
                     self.gpu_kv_caches,
                     self.cpu_kv_caches,
@@ -339,11 +350,112 @@ class SimpleCPUOffloadWorker:
                     inject_gpu_load=self.options.fingerprint_inject_gpu_load,
                     inject_cpu_load=self.options.fingerprint_inject_cpu_load,
                     corrupt_plan=self.options.fingerprint_corrupt_plan,
+                    gpu_views=gpu_views,
+                    cpu_views=cpu_views,
                 )
                 self._backend.fp = self._fp
             except Exception:
                 logger.exception("SimpleCPU fp could not be enabled")
                 self._fp = None
+
+    def _typed_views(
+        self,
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+        seen_ptrs: dict[int, tuple[str, torch.Tensor]],
+    ) -> tuple[
+        dict[str, list[tuple[str, torch.Tensor]]],
+        dict[str, list[tuple[str, torch.Tensor]]],
+    ]:
+        """Typed [blocks, ...] views of every registered region and of its
+        CPU mirror, tagged with what the region holds (fingerprint
+        REGION_PARTS): K and V of an attention layer whose cache is laid out
+        (blocks, 2, ...) or (2, blocks, ...), a whole attention region
+        otherwise, or each state tensor of a state-space layer. The KV cache
+        groups decide between attention and state; without them the layout
+        does (a list of tensors is a state-space layer)."""
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
+        group_of: dict[str, int] = {}
+        groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config else []
+        for g, group in enumerate(groups):
+            for layer_name in group.layer_names:
+                group_of[layer_name] = g
+        gpu_views: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        cpu_views: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        num_blocks = self.gpu_kv_caches[next(iter(self.gpu_kv_caches))].shape[0]
+        for name, tensor in seen_ptrs.values():
+            value = kv_caches[name]
+            gi = group_of.get(name)
+            spec = groups[gi].kv_cache_spec if gi is not None else None
+            is_state = (
+                isinstance(spec, MambaSpec)
+                if spec is not None
+                else isinstance(value, list)
+            )
+            if is_state:
+                state = value if isinstance(value, list) else [value]
+                raw = self.gpu_kv_caches.get(name)
+                if raw is None:
+                    continue
+                cpu_raw = self.cpu_kv_caches[name]
+                parts: list[tuple[str, torch.Tensor]] = []
+                cparts: list[tuple[str, torch.Tensor]] = []
+                for t in state:
+                    if t.shape[0] != num_blocks:
+                        continue
+                    parts.append(("state", t))
+                    # The same strided layout over the CPU rows: state
+                    # tensors are interleaved per block in the raw storage.
+                    cparts.append(
+                        (
+                            "state",
+                            torch.as_strided(
+                                cpu_raw.view(t.dtype),
+                                (cpu_raw.shape[0], *t.shape[1:]),
+                                t.stride(),
+                                t.storage_offset(),
+                            ),
+                        )
+                    )
+                gpu_views[name] = parts
+                cpu_views[name] = cparts
+                continue
+            assert isinstance(value, torch.Tensor)
+            if (
+                value.dim() >= 2
+                and value.shape[0] == 2
+                and value.shape[1] == num_blocks
+            ):
+                # (2, blocks, ...): two registered regions, K and V.
+                for idx, part in enumerate(("k", "v")):
+                    region = f"{name}.{idx}"
+                    if region in self.gpu_kv_caches:
+                        gpu_views[region] = [(part, value[idx])]
+                        cpu = self.cpu_kv_caches[region]
+                        cpu_views[region] = [
+                            (part, cpu.view(value.dtype).view(cpu.shape[0], -1))
+                        ]
+                continue
+            if name not in self.gpu_kv_caches:
+                continue
+            cpu = self.cpu_kv_caches[name]
+            if (
+                value.dim() >= 2
+                and value.shape[0] == num_blocks
+                and value.shape[1] == 2
+            ):
+                # (blocks, 2, ...): K and V halves of one region.
+                flat = value.reshape(num_blocks, 2, -1)
+                cflat = cpu.view(value.dtype).view(cpu.shape[0], 2, -1)
+                gpu_views[name] = [("k", flat[:, 0]), ("v", flat[:, 1])]
+                cpu_views[name] = [("k", cflat[:, 0]), ("v", cflat[:, 1])]
+            else:
+                gpu_views[name] = [("attn", value.reshape(num_blocks, -1))]
+                cpu_views[name] = [
+                    ("attn", cpu.view(value.dtype).view(cpu.shape[0], -1))
+                ]
+        return gpu_views, cpu_views
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         if metadata.num_cpu_blocks and metadata.num_cpu_blocks != self.num_cpu_blocks:
@@ -357,9 +469,39 @@ class SimpleCPUOffloadWorker:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
             self._pending_store_event_indices.add(metadata.store_event)
+        if metadata.controls:
+            self._apply_controls(metadata.controls)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
+
+    def _apply_controls(self, controls: dict[str, str]) -> None:
+        """Runtime controls from request directives (experiments): flip the
+        SM70 QSA grouped page4 route or its padding fix, or the NaN count
+        of the logits, in this worker process without a restart."""
+        import importlib
+        import os
+
+        for name, value in controls.items():
+            if self._controls.get(name) == value:
+                continue
+            if name in ("qsa_grouped_page4", "qsa_grouped_pad_fix"):
+                qsa = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa")
+                attr = (
+                    "_SM70_QSA_GROUPED_PAGE4"
+                    if name == "qsa_grouped_page4"
+                    else "_SM70_QSA_GROUPED_PAD_FIX"
+                )
+                setattr(qsa, attr, value == "1")
+            elif name == "compute_nans_in_logits":
+                os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = value
+            else:
+                logger.warning("SimpleCPU control %s=%s: unknown, ignored", name, value)
+                continue
+            self._controls[name] = value
+            logger.warning(
+                "SimpleCPU control applied rank=%d %s=%s", _global_rank(), name, value
+            )
 
     def start_load_kv(self) -> None:
         # NOTE: we defer launching both load and store to get_finished(),
@@ -428,7 +570,12 @@ class SimpleCPUOffloadWorker:
 
         if self._pending_load_event_indices or self._load_launches:
             load_wm = self._poll_stream_events(is_store=False)
-            for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
+            for j in sorted(
+                j for j in self._pending_load_event_indices if j <= load_wm
+            ):
+                if j in self._gated_loads and not self._gate_verdict(j, metadata):
+                    # Verdict still pending: the request waits one more step.
+                    continue
                 self._pending_load_event_indices.discard(j)
                 req_ids = (
                     metadata.load_event_to_reqs.get(j) if metadata is not None else None
@@ -540,14 +687,31 @@ class SimpleCPUOffloadWorker:
         self._check_block_ids(cpu_blocks, gpu_blocks)
         launches = self._store_launches if is_store else self._load_launches
         launches[event_idx] = _Launch(self._clock(), cpu_blocks, gpu_blocks)
+        metadata = self._connector_metadata
         if self._fp is not None:
             # Before the copy is queued, so the checker sees the launch first.
             if is_store:
+                kinds = metadata.store_block_kinds if metadata is not None else []
                 self._fp.store_launched(
-                    event_idx, gpu_blocks, cpu_blocks, torch.cuda.current_stream()
+                    event_idx,
+                    gpu_blocks,
+                    cpu_blocks,
+                    torch.cuda.current_stream(),
+                    kinds=list(kinds) if len(kinds) == len(gpu_blocks) else None,
                 )
             else:
-                self._fp.load_launched(event_idx, cpu_blocks, gpu_blocks)
+                kinds = metadata.load_block_kinds if metadata is not None else []
+                corrupt = metadata.load_corrupt.get(event_idx) if metadata else None
+                self._fp.load_launched(
+                    event_idx,
+                    cpu_blocks,
+                    gpu_blocks,
+                    kinds=list(kinds) if len(kinds) == len(gpu_blocks) else None,
+                    corrupt=[tuple(span) for span in corrupt] if corrupt else None,  # type: ignore[misc]
+                )
+                if metadata is not None and metadata.load_gate.get(event_idx):
+                    # The deadline starts when the copy completes.
+                    self._gated_loads[event_idx] = (-1.0, list(gpu_blocks))
         if is_store:
             self._backend.launch_copy(
                 gpu_blocks,
@@ -604,6 +768,57 @@ class SimpleCPUOffloadWorker:
                     f"({len(launch.gpu_blocks)} blocks) has not completed "
                     f"{age_s:.1f}s after launch (transfer_timeout_s={timeout_s})"
                 )
+
+    def _gate_verdict(
+        self, event_idx: int, metadata: SimpleCPUOffloadMetadata | None
+    ) -> bool:
+        """Whether a completed gated load may be reported to the scheduler.
+        With a verdict naming bad blocks, the blocks of every request whose
+        span holds one are reported as failed loads; without a verdict the
+        load is held back until the gate timeout."""
+        now = self._clock()
+        deadline, gpu_blocks = self._gated_loads[event_idx]
+        if deadline < 0:
+            deadline = now + self.options.fingerprint_gate_timeout_s
+            self._gated_loads[event_idx] = (deadline, gpu_blocks)
+        verdict = self._fp.pop_load_verdict(event_idx) if self._fp else []
+        if verdict is None:
+            if now < deadline:
+                return False
+            logger.warning(
+                "SimpleCPU gate rank=%d load event=%d: no fingerprint verdict "
+                "within %.1fs, reported as loaded",
+                _global_rank(),
+                event_idx,
+                self.options.fingerprint_gate_timeout_s,
+            )
+            verdict = []
+        del self._gated_loads[event_idx]
+        if not verdict:
+            return True
+        spans = metadata.load_spans.get(event_idx) if metadata is not None else None
+        bad: set[int] = set()
+        if spans and gpu_blocks:
+            for start, end in spans:
+                if any(start <= pos < end for pos in verdict):
+                    bad.update(gpu_blocks[start:end])
+        elif gpu_blocks:
+            bad.update(gpu_blocks)
+        self._invalid_block_ids.update(bad)
+        logger.warning(
+            "SimpleCPU gate rank=%d load event=%d FAILED: %d bad blocks at "
+            "positions=%s; %d GPU blocks reported for recompute",
+            _global_rank(),
+            event_idx,
+            len(verdict),
+            verdict[:16],
+            len(bad),
+        )
+        return True
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid, self._invalid_block_ids = self._invalid_block_ids, set()
+        return invalid
 
     def get_stats(self) -> SimpleCPUOffloadStats | None:
         """Transfer stats since the last call, or None if there are none."""
