@@ -31,6 +31,7 @@ from vllm.v1.simple_kv_offload.metadata import (
 )
 from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 from vllm.v1.simple_kv_offload.stats import (
+    CPU_BLOCKS_QUARANTINED,
     CPU_CACHED_BLOCKS_LAST,
     CPU_HIT_WAIT_S_MAX,
     CPU_HITS_COLD_FALLBACK,
@@ -96,6 +97,7 @@ CONTROLS = {
     "qsa_grouped_page4": ("0", "1"),
     "qsa_grouped_pad_fix": ("0", "1"),
     "compute_nans_in_logits": ("0", "1"),
+    "copy_backend": ("batch", "memcpy"),
 }
 DIRECTIVE_KEY = "simple_cpu"
 
@@ -276,6 +278,8 @@ class SimpleCPUOffloadScheduler:
         self._load_gate: dict[int, bool] = {}
         # Runtime controls requested by directives, sent with the next step.
         self._pending_controls: dict[str, str] = {}
+        # CPU blocks taken out of circulation after a bad gated load.
+        self._quarantined: set[int] = set()
 
         # CPU hits found by get_num_new_matched_tokens(), kept pinned via
         # touch() while awaiting update_state_after_alloc().
@@ -1392,6 +1396,8 @@ class SimpleCPUOffloadScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
             return
+        if meta.bad_cpu_blocks:
+            self._quarantine(meta.bad_cpu_blocks)
         for event_idx, count in meta.completed_store_events.items():
             total = self._store_event_pending_counts.get(event_idx, 0) + count
             if total >= self._expected_worker_count:
@@ -1430,6 +1436,23 @@ class SimpleCPUOffloadScheduler:
                 _ranges([cid for _, cid in bad]),
                 state.num_local_hit_tokens,
             )
+
+    def _quarantine(self, cpu_block_ids: list[int]) -> None:
+        """Keep CPU blocks that delivered bad content out of circulation: an
+        extra reference keeps them off the free queue for good."""
+        new = [bid for bid in cpu_block_ids if bid not in self._quarantined]
+        if not new:
+            return
+        blocks = [self.cpu_block_pool.blocks[bid] for bid in new]
+        self.cpu_block_pool.evict_blocks(set(new))
+        self.cpu_block_pool.touch(blocks)
+        self._quarantined.update(new)
+        self._stats.add(CPU_BLOCKS_QUARANTINED, len(new))
+        logger.warning(
+            "SimpleCPU quarantine: CPU blocks %s are never used again (%d in all)",
+            _ranges(new),
+            len(self._quarantined),
+        )
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""

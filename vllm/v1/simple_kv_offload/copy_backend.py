@@ -54,8 +54,15 @@ class DmaCopyBackend:
 
     def __init__(self) -> None:
         self.mode: str | None = None
-        self._store_params: BatchMemcpyParams | SwapBlocksParams | None = None
-        self._load_params: BatchMemcpyParams | SwapBlocksParams | None = None
+        # mode -> (store params, load params); "memcpy" is always built, so a
+        # control directive can switch modes at run time (set_mode).
+        self._params: dict[
+            str,
+            tuple[
+                BatchMemcpyParams | SwapBlocksParams,
+                BatchMemcpyParams | SwapBlocksParams,
+            ],
+        ] = {}
         self._load_stream: torch.cuda.Stream | None = None
         self._store_stream: torch.cuda.Stream | None = None
         self._queue: queue.SimpleQueue | None = None
@@ -91,12 +98,15 @@ class DmaCopyBackend:
             copy_backend,
             driver_version(),
         )
-        self._store_params = self._make_params(
-            self.mode, gpu_caches, cpu_caches, store_stream, is_store=True
-        )
-        self._load_params = self._make_params(
-            self.mode, cpu_caches, gpu_caches, load_stream, is_store=False
-        )
+        for mode in {self.mode, "memcpy"}:
+            self._params[mode] = (
+                self._make_params(
+                    mode, gpu_caches, cpu_caches, store_stream, is_store=True
+                ),
+                self._make_params(
+                    mode, cpu_caches, gpu_caches, load_stream, is_store=False
+                ),
+            )
         self._fail_next_copy = bool(
             test_switch("VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY")
         )
@@ -125,13 +135,23 @@ class DmaCopyBackend:
         events_list: list[TransferEvent],
     ) -> None:
         self.check()
-        params = self._store_params if is_store else self._load_params
-        assert params is not None and self._queue is not None
+        assert self.mode is not None and self._queue is not None
+        params = self._params[self.mode][0 if is_store else 1]
         with self._cond:
             self._num_enqueued += 1
         self._queue.put(
             (src_blocks, dst_blocks, params, is_store, event_idx, events_list)
         )
+
+    def set_mode(self, mode: str) -> str:
+        """Switch the copy mode of later transfers (diagnostics); returns
+        the mode now in effect."""
+        if mode not in self._params:
+            raise ValueError(
+                f"copy mode {mode!r} is not available (have {sorted(self._params)})"
+            )
+        self.mode = mode
+        return mode
 
     def check(self) -> None:
         """Re-raise a copy-thread failure on the calling thread."""

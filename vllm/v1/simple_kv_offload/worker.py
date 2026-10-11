@@ -171,7 +171,10 @@ class SimpleCPUOffloadWorker:
         # worker clock by which the chain's verdict must have arrived, GPU
         # blocks); a completed gated load is reported to the scheduler only
         # with its verdict.
-        self._gated_loads: dict[int, tuple[float, list[int]]] = {}
+        self._gated_loads: dict[int, tuple[float, list[int], list[int]]] = {}
+        # CPU blocks a gated load found bad, reported once through the worker
+        # metadata so the scheduler quarantines them.
+        self._bad_cpu_blocks: list[int] = []
         # GPU blocks of failed gated loads, reported once through
         # get_block_ids_with_load_errors().
         self._invalid_block_ids: set[int] = set()
@@ -520,6 +523,8 @@ class SimpleCPUOffloadWorker:
                     else "_SM70_QSA_GROUPED_PAD_FIX"
                 )
                 setattr(qsa, attr, value == "1")
+            elif name == "copy_backend":
+                self._backend.set_mode(value)
             elif name == "compute_nans_in_logits":
                 os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = value
                 # envs values are cached once the service is up
@@ -778,7 +783,11 @@ class SimpleCPUOffloadWorker:
                 )
                 if metadata is not None and metadata.load_gate.get(event_idx):
                     # The deadline starts when the copy completes.
-                    self._gated_loads[event_idx] = (-1.0, list(gpu_blocks))
+                    self._gated_loads[event_idx] = (
+                        -1.0,
+                        list(gpu_blocks),
+                        list(cpu_blocks),
+                    )
         if is_store:
             self._backend.launch_copy(
                 gpu_blocks,
@@ -844,10 +853,10 @@ class SimpleCPUOffloadWorker:
         span holds one are reported as failed loads; without a verdict the
         load is held back until the gate timeout."""
         now = self._clock()
-        deadline, gpu_blocks = self._gated_loads[event_idx]
+        deadline, gpu_blocks, cpu_blocks = self._gated_loads[event_idx]
         if deadline < 0:
             deadline = now + self.options.fingerprint_gate_timeout_s
-            self._gated_loads[event_idx] = (deadline, gpu_blocks)
+            self._gated_loads[event_idx] = (deadline, gpu_blocks, cpu_blocks)
         verdict = self._fp.pop_load_verdict(event_idx) if self._fp else []
         if verdict is None:
             if now < deadline:
@@ -881,7 +890,94 @@ class SimpleCPUOffloadWorker:
             verdict[:16],
             len(bad),
         )
+        bad_cpu = [cpu_blocks[i] for i in verdict if i < len(cpu_blocks)]
+        self._bad_cpu_blocks.extend(bad_cpu)
+        try:
+            self._recheck_bad_rows(event_idx, verdict, gpu_blocks, cpu_blocks)
+        except Exception:
+            logger.exception("SimpleCPU recheck failed")
         return True
+
+    def _recheck_bad_rows(
+        self,
+        event_idx: int,
+        positions: list[int],
+        gpu_blocks: list[int],
+        cpu_blocks: list[int],
+    ) -> None:
+        """Diagnostics after a failed gated load (host-synchronous, only on
+        failure): copy each bad CPU row again with a plain cudaMemcpy, and
+        log whether that copy equals the CPU bytes (the pages are readable)
+        and the loaded block (the earlier copy delivered the same), how many
+        all-ones bytes each holds, and the guest-physical pages of the row's
+        first differing region."""
+        import struct
+
+        assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
+        for i in positions[:4]:
+            cid, gid = cpu_blocks[i], gpu_blocks[i]
+            differing: list[str] = []
+            plain_ok = True
+            ff_loaded = ff_plain = 0
+            first: str | None = None
+            for name, gpu_region in self.gpu_kv_caches.items():
+                cpu_row = self.cpu_kv_caches[name][cid]
+                loaded = gpu_region[gid]
+                plain = cpu_row.to(loaded.device)
+                torch.cuda.synchronize(loaded.device)
+                if not torch.equal(plain.cpu(), cpu_row):
+                    plain_ok = False
+                if not torch.equal(plain, loaded):
+                    differing.append(name)
+                    if first is None:
+                        first = name
+                    ff_loaded += int((loaded == -1).sum())
+                    ff_plain += int((plain == -1).sum())
+            gpas = ""
+            if first is not None:
+                row = self.cpu_kv_caches[first][cid]
+                base = row.data_ptr()
+                n = (row.numel() * row.element_size() + 4095) // 4096
+                pages = []
+                try:
+                    with open("/proc/self/pagemap", "rb") as pm:
+                        pm.seek((base // 4096) * 8)
+                        data = pm.read(n * 8)
+                    for k in range(n):
+                        e = struct.unpack_from("<Q", data, k * 8)[0]
+                        pages.append(
+                            (e & ((1 << 55) - 1)) * 4096 if (e >> 63) & 1 else -1
+                        )
+                    runs: list[list[int]] = []
+                    for g in pages:
+                        if runs and g == runs[-1][1] + 4096:
+                            runs[-1][1] = g
+                        else:
+                            runs.append([g, g])
+                    gpas = ",".join(f"{a:#x}-{b + 4096:#x}" for a, b in runs[:12])
+                except OSError as err:
+                    gpas = f"pagemap unavailable: {err}"
+            logger.warning(
+                "SimpleCPU recheck rank=%d event=%d pos=%d cpu=%d gpu=%d: plain "
+                "H2D copy %s the CPU bytes; regions differing from the loaded "
+                "block=%d/%d (first %s); all-ones bytes loaded=%d plain=%d; "
+                "vaddr=%#x gpa=%s",
+                _global_rank(),
+                event_idx,
+                i,
+                cid,
+                gid,
+                "EQUALS" if plain_ok else "DIFFERS FROM",
+                len(differing),
+                len(self.gpu_kv_caches),
+                first,
+                ff_loaded,
+                ff_plain,
+                self.cpu_kv_caches[first or next(iter(self.cpu_kv_caches))][
+                    cid
+                ].data_ptr(),
+                gpas,
+            )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid, self._invalid_block_ids = self._invalid_block_ids, set()
@@ -894,13 +990,16 @@ class SimpleCPUOffloadWorker:
         return self._stats.clone_and_reset()
 
     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:
-        """Return completed store events since the last call."""
-        if not self._completed_store_events:
+        """Return completed store events and bad CPU blocks since the last
+        call."""
+        if not self._completed_store_events and not self._bad_cpu_blocks:
             return None
         meta = SimpleCPUOffloadWorkerMetadata(
             completed_store_events=self._completed_store_events,
+            bad_cpu_blocks=sorted(set(self._bad_cpu_blocks)),
         )
         self._completed_store_events = {}
+        self._bad_cpu_blocks = []
         return meta
 
     def handle_preemptions(
