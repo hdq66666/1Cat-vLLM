@@ -485,6 +485,32 @@ class SimpleCPUOffloadWorker:
                     ("attn", cpu.view(value.dtype).view(cpu.shape[0], -1))
                 ]
             region_groups[name] = gi
+        # What the chain will see, once per process: a region without K/V
+        # parts cannot be damaged by the nan_v/nan_k modes.
+        desc = []
+        for region in self.gpu_kv_caches:
+            part_names = ",".join(p for p, _ in gpu_views.get(region, [])) or "none"
+            src = kv_caches.get(
+                region.rsplit(".", 1)[0] if region not in kv_caches else region
+            )
+            t = src[0] if isinstance(src, list) else src
+            shape = tuple(t.shape) if isinstance(t, torch.Tensor) else "?"
+            dtype = (
+                str(t.dtype).replace("torch.", "")
+                if isinstance(t, torch.Tensor)
+                else "?"
+            )
+            desc.append(
+                f"{region}:g{region_groups.get(region, -1)}:"
+                f"{part_names}:{shape}:{dtype}"
+            )
+        logger.info(
+            "SimpleCPU fp views rank=%d: %d regions, state groups %s; %s",
+            _global_rank(),
+            len(desc),
+            sorted(state_groups),
+            " ".join(desc),
+        )
         return gpu_views, cpu_views, region_groups, state_groups
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
