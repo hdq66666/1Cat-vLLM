@@ -80,6 +80,24 @@ def test_faithful_round_trip_is_silent():
     }
 
 
+def test_host_buffers_cross_inference_mode():
+    # The engine thread runs in inference mode, the copy thread does not, and
+    # both reuse the same host buffers.
+    chain, gpu, cpu = _make()
+    with torch.inference_mode():
+        first = chain.snapshot(None)
+    chain._release(first)
+    second = chain.snapshot(None)
+    assert second.host is first.host
+    with torch.inference_mode():
+        _store(chain, gpu, cpu, 0, [3], [7])
+    chain.drain()
+    _load(chain, gpu, cpu, 0, [7], [1])
+    with torch.inference_mode():
+        chain.drain()
+    assert chain.counters["mismatch_events"] == 0 and chain.counters["loads"] == 1
+
+
 def _flip(tensor, block):
     def fn():
         tensor[block, 8] ^= 1
