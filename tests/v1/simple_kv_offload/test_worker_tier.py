@@ -15,16 +15,6 @@ from unittest import mock
 import msgspec
 import pytest
 import torch
-
-from vllm.platforms import current_platform
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
-from vllm.v1.simple_kv_offload import copy_backend as copy_backend_mod
-from vllm.v1.simple_kv_offload import host_mem
-from vllm.v1.simple_kv_offload import worker as worker_mod
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
-from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
-from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 from vllm.v1.simple_kv_offload.stats import (
     LOAD_BLOCKS,
@@ -43,6 +33,16 @@ from vllm.v1.simple_kv_offload.stats import (
     VERIFY_MISMATCH,
     SimpleCPUOffloadStats,
 )
+
+from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+from vllm.v1.simple_kv_offload import copy_backend as copy_backend_mod
+from vllm.v1.simple_kv_offload import host_mem
+from vllm.v1.simple_kv_offload import worker as worker_mod
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
+from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
+from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker, _Launch
 
 if not current_platform.is_cuda():
@@ -945,6 +945,7 @@ def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
     class FakeQSA:
         _SM70_QSA_GROUPED_PAGE4 = True
         _SM70_QSA_GROUPED_PAD_FIX = True
+        _SM70_QSA_GROUPED_PAGE4_CALLS = 7
 
     import sys
 
@@ -972,4 +973,5 @@ def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
         FakeQSA._SM70_QSA_GROUPED_PAGE4 is True
         and worker._controls["qsa_grouped_page4"] == "1"
     )
+    assert "grouped_page4_calls=7" in worker._control_status()
     del applied
