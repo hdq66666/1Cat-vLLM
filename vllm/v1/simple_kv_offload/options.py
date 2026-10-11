@@ -87,6 +87,10 @@ class SimpleCPUOffloadOptions:
     fingerprint: bool = False
     fingerprint_inject_gpu_load: int = 0
     fingerprint_inject_cpu_load: int = 0
+    # fingerprint_corrupt_plan: deliberately damage the blocks of given loads
+    # ("<load number>:<mode>[=N];..." with modes zero_fa, zero_state, nan_fa,
+    # swap_fa; see fingerprint.parse_corrupt_plan). Experiments only.
+    fingerprint_corrupt_plan: str = ""
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
@@ -190,6 +194,12 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
     ):
         if key in cfg:
             kwargs[key] = _as_float(key, cfg[key], minimum)
+    if cfg.get("fingerprint_corrupt_plan"):
+        from vllm.v1.simple_kv_offload.fingerprint import parse_corrupt_plan
+
+        plan = str(cfg["fingerprint_corrupt_plan"])
+        parse_corrupt_plan(plan)  # validate early
+        kwargs["fingerprint_corrupt_plan"] = plan
     return SimpleCPUOffloadOptions(**kwargs)
 
 

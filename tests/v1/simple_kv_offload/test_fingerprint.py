@@ -193,6 +193,46 @@ def test_injections_are_reported():
     assert "load cpu-at-rest" in chain.reports
 
 
+@pytest.mark.parametrize(
+    "mode,check",
+    [
+        ("zero_fa=2", lambda gpu, before: bool((gpu["fa"][[1, 2]] == 0).all())),
+        ("zero_state=1", lambda gpu, before: bool((gpu["state"][6] == 0).all())),
+        ("nan_fa=1", lambda gpu, before: bool((gpu["fa"][1] == -1).all())),
+        (
+            "swap_fa=1",
+            lambda gpu, before: torch.equal(gpu["fa"][1], before["fa"][2])
+            and not torch.equal(gpu["fa"][1], before["fa"][1]),
+        ),
+    ],
+)
+def test_corrupt_plan_damages_the_chosen_load(mode, check):
+    chain, gpu, cpu = _make(corrupt_plan=f"2:{mode}")
+    _store(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9])
+    chain.drain()
+    for name in gpu:
+        gpu[name][[3, 4, 5]] = 1
+    # Load 1 is left alone, load 2 is damaged when it is seen complete.
+    _load(chain, gpu, cpu, 0, [7, 8, 9], [9, 10, 11])
+    chain.drain()
+    chain.load_seen_complete(0)
+    _load(chain, gpu, cpu, 1, [7, 8, 9], [1, 2, 6])
+    chain.drain()
+    before = {name: t.clone() for name, t in gpu.items()}
+    chain.load_seen_complete(1)
+    assert check(gpu, before)
+    assert torch.equal(gpu["fa"][[9, 10, 11]], before["fa"][[9, 10, 11]])
+    _steps(chain, WATCH_STEPS[-1] + 2)
+    assert "watch +0 steps" in chain.reports
+
+
+def test_corrupt_plan_is_validated():
+    with pytest.raises(ValueError, match="unknown corrupt mode"):
+        parse_options({"fingerprint_corrupt_plan": "3:melt"})
+    plan = "3:zero_fa=8;19:nan_fa"
+    assert parse_options({"fingerprint_corrupt_plan": plan}).fingerprint_corrupt_plan == plan
+
+
 def test_options():
     assert parse_options({}).fingerprint is False
     options = parse_options(
