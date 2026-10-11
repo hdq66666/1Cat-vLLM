@@ -576,13 +576,23 @@ class FingerprintChain:
                             view[gid].fill_(value)
                             touched += 1
         if part is not None and not touched:
+            views = sum(
+                1
+                for parts in self._parts
+                for p, _, cv in parts
+                if p == part and (cv is not None or not on_cpu)
+            )
             logger.warning(
-                "SimpleCPU fp CORRUPT %s rank=%d load event=%d: no %s views, "
-                "nothing damaged",
+                "SimpleCPU fp CORRUPT %s rank=%d load event=%d: %d %s views, "
+                "%d/%d attention blocks, targets=%s: nothing damaged",
                 mode,
                 self.rank,
                 event_idx,
+                views,
                 part.upper(),
+                len(attn),
+                len(gpu_ids),
+                targets,
             )
             return
         logger.warning(
