@@ -16,6 +16,16 @@ import msgspec
 import pytest
 import torch
 from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
+
+from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+from vllm.v1.simple_kv_offload import copy_backend as copy_backend_mod
+from vllm.v1.simple_kv_offload import host_mem
+from vllm.v1.simple_kv_offload import worker as worker_mod
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
+from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
+from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 from vllm.v1.simple_kv_offload.stats import (
     LOAD_BLOCKS,
     LOAD_BYTES,
@@ -33,16 +43,6 @@ from vllm.v1.simple_kv_offload.stats import (
     VERIFY_MISMATCH,
     SimpleCPUOffloadStats,
 )
-
-from vllm.platforms import current_platform
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
-from vllm.v1.simple_kv_offload import copy_backend as copy_backend_mod
-from vllm.v1.simple_kv_offload import host_mem
-from vllm.v1.simple_kv_offload import worker as worker_mod
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
-from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
-from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker, _Launch
 
 if not current_platform.is_cuda():
@@ -891,8 +891,22 @@ def test_gate_fails_the_request_whose_block_carries_non_finite_values(
         # CPU block 0 restores into GPU block 6, request "b"'s first block.
         worker.cpu_kv_caches["attn.0.1"].view(torch.float16)[0, 3] = float("nan")
 
+    # The bad CPU block is reported once through the worker metadata (the
+    # drive loop collects it every step) for the scheduler's quarantine.
+    reported: list[int] = []
+    build = worker.build_connector_worker_meta
+
+    def spy():
+        meta = build()
+        if meta is not None:
+            reported.extend(meta.bad_cpu_blocks)
+        return meta
+
+    worker.build_connector_worker_meta = spy  # type: ignore[method-assign]
     assert _gated_round_trip(worker, nan_in_v_of_cpu_block_0) == {6, 0}
     assert worker.get_block_ids_with_load_errors() == set()
+    assert reported == [0]
+    assert worker.build_connector_worker_meta() is None
     assert "nonfinite load restored(gpu after copy)" in worker._fp.reports
     assert "nonfinite load cpu-at-launch" in worker._fp.reports
     # The CPU block changed after its store: named as well.
@@ -997,3 +1011,25 @@ def test_gate_fails_a_load_damaged_by_a_cpu_corrupt_directive(make_worker) -> No
     assert "load cpu-at-rest" in reports
     assert "nonfinite load restored(gpu after copy)" in reports
     assert "load cpu->gpu" not in reports
+
+
+def test_copy_mode_switches_at_run_time(make_worker) -> None:
+    """control copy_backend: later transfers use the other copy path and
+    the data still round-trips."""
+    worker = make_worker(fingerprint=True)
+    backend = worker._backend
+    first = backend.mode
+    assert first in ("batch", "memcpy") and "memcpy" in backend._params
+    other = "memcpy" if first == "batch" else first
+    worker.bind_connector_metadata(
+        SimpleCPUOffloadMetadata(controls={"copy_backend": other})
+    )
+    worker.clear_connector_metadata()
+    assert backend.mode == other and worker._controls["copy_backend"] == other
+    assert _gated_round_trip(worker) == set()
+    assert (
+        worker._fp.counters["loads"] == 1
+        and worker._fp.counters["mismatch_events"] == 0
+    )
+    with pytest.raises(ValueError, match="not available"):
+        backend.set_mode("bogus")

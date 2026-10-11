@@ -554,3 +554,58 @@ def test_request_directives_reach_the_worker_metadata() -> None:
     )
     _, meta = _step(scheduler3)
     assert meta.controls == {}
+
+
+def test_bad_cpu_blocks_reported_by_workers_are_quarantined() -> None:
+    """Worker metadata names CPU blocks that delivered bad content: the
+    manager evicts them and keeps them out of the free queue for good."""
+    scheduler = _make_scheduler()
+    _, meta, repeat, _ = _admit_cpu_hit_with_fresh_request(scheduler)
+    manager = scheduler.connector.scheduler_manager
+    state = manager._reqs_to_load["B"]
+    bad = list(state.transfer_meta.cpu_block_ids[:2])
+    worker_meta = SimpleCPUOffloadWorkerMetadata(
+        completed_store_events={}, bad_cpu_blocks=bad
+    )
+    merged = worker_meta.aggregate(
+        SimpleCPUOffloadWorkerMetadata(
+            completed_store_events={}, bad_cpu_blocks=bad[1:] + [bad[0]]
+        )
+    )
+    assert merged.bad_cpu_blocks == sorted(bad)
+    manager.update_connector_output(
+        KVConnectorOutput(
+            finished_sending=set(),
+            finished_recving={"B"},
+            invalid_block_ids=set(state.transfer_meta.gpu_block_ids),
+            kv_connector_worker_meta=merged,
+        )
+    )
+    assert manager._quarantined == set(bad)
+    for bid in bad:
+        blk = manager.cpu_block_pool.blocks[bid]
+        assert blk.ref_cnt >= 1 and blk.block_hash is None
+    # Reporting them again changes nothing.
+    manager.update_connector_output(
+        KVConnectorOutput(
+            finished_sending=set(),
+            finished_recving=set(),
+            kv_connector_worker_meta=merged,
+        )
+    )
+    assert manager._quarantined == set(bad)
+    assert manager._stats.data["cpu_blocks_quarantined"] == len(bad)
+    # The tier keeps working: the request is recomputed and stored again
+    # without the quarantined blocks.
+    for _ in range(PROMPT_LEN + 8):
+        _step(scheduler)
+        if "B" not in scheduler.requests:
+            break
+    for _ in range(6):
+        _step(scheduler)
+    used = {
+        blk.block_id
+        for blk in manager.cpu_block_pool.blocks
+        if blk.block_hash is not None
+    }
+    assert not used & set(bad)

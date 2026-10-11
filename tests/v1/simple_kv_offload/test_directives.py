@@ -4,13 +4,13 @@
 options.allow_request_directives): strictly validated, experiments only."""
 
 import pytest
+from vllm.v1.simple_kv_offload.options import parse_options
 
 from vllm.v1.simple_kv_offload.manager import (
     CONTROLS,
     Directives,
     parse_directives,
 )
-from vllm.v1.simple_kv_offload.options import parse_options
 
 pytestmark = pytest.mark.cpu_test
 
@@ -61,8 +61,10 @@ def test_controls_have_two_states():
         "qsa_grouped_page4",
         "qsa_grouped_pad_fix",
         "compute_nans_in_logits",
+        "copy_backend",
     }
-    assert all(values == ("0", "1") for values in CONTROLS.values())
+    assert CONTROLS["copy_backend"] == ("batch", "memcpy")
+    assert all(len(values) == 2 for values in CONTROLS.values())
 
 
 def test_options():

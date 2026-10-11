@@ -70,6 +70,9 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_store_events: dict[int, int]
+    # CPU blocks whose content a gated load found bad on this worker (union
+    # across workers): the scheduler keeps them out of circulation.
+    bad_cpu_blocks: list[int] = field(default_factory=list)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -78,4 +81,7 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
         merged = dict(self.completed_store_events)
         for k, v in other.completed_store_events.items():
             merged[k] = merged.get(k, 0) + v
-        return SimpleCPUOffloadWorkerMetadata(completed_store_events=merged)
+        return SimpleCPUOffloadWorkerMetadata(
+            completed_store_events=merged,
+            bad_cpu_blocks=sorted(set(self.bad_cpu_blocks) | set(other.bad_cpu_blocks)),
+        )
