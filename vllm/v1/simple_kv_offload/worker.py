@@ -522,6 +522,12 @@ class SimpleCPUOffloadWorker:
                 setattr(qsa, attr, value == "1")
             elif name == "compute_nans_in_logits":
                 os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = value
+                # envs values are cached once the service is up
+                # (enable_envs_cache in the worker process): drop the cache
+                # so the model runner's next read sees the new value.
+                cache_clear = getattr(envs.__getattr__, "cache_clear", None)
+                if cache_clear is not None:
+                    cache_clear()
             else:
                 logger.warning("SimpleCPU control %s=%s: unknown, ignored", name, value)
                 continue

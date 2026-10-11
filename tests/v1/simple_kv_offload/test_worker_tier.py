@@ -951,6 +951,12 @@ def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
 
     monkeypatch.setitem(sys.modules, "vllm.models.qwen4_exp.nvidia.ops.qsa", FakeQSA)
     monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0")
+    # The service caches envs values after start-up (worker processes too):
+    # a control must still reach the model runner's next read.
+    import vllm.envs as envs
+
+    envs.enable_envs_cache()
+    assert envs.VLLM_COMPUTE_NANS_IN_LOGITS is False
     meta = SimpleCPUOffloadMetadata(
         controls={"qsa_grouped_page4": "0", "compute_nans_in_logits": "1", "x": "1"}
     )
@@ -960,6 +966,8 @@ def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
     import os
 
     assert os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] == "1"
+    assert envs.VLLM_COMPUTE_NANS_IN_LOGITS is True
+    envs.disable_envs_cache()
     assert worker._controls == {"qsa_grouped_page4": "0", "compute_nans_in_logits": "1"}
     FakeQSA._SM70_QSA_GROUPED_PAGE4 = True  # the same value again is a no-op
     worker.bind_connector_metadata(
