@@ -796,6 +796,17 @@ class SimpleCPUOffloadScheduler:
                 _ranges(gpu_block_ids),
                 _ranges(cpu_block_ids),
             )
+            # The request's whole block rows, in order, per KV cache group
+            # (0 = null block): which entries were loaded and which are fresh.
+            logger.info(
+                "SimpleCPU load rows req=%s computed=%d %s",
+                req_id,
+                total_computed_tokens,
+                " ".join(
+                    f"g{g}[{len(ids)}]={','.join(map(str, ids[-12:]))}"
+                    for g, ids in enumerate(block_ids_by_group)
+                ),
+            )
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
