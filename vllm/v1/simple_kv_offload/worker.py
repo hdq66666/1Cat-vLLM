@@ -1073,16 +1073,26 @@ class SimpleCPUOffloadWorker:
                 f"[page {k} gpa {gpas.get(k, -1):#x}: vs_cpu {nbad_cpu}B"
                 f"{' ones' if ones else ''} vs_loaded {nbad_load}B {sample}]"
             )
+        # Per page, again: up = a copy of just that page read through the
+        # GPU against the CPU bytes; down = a fresh pattern written by the
+        # GPU into that page of the CPU row (the row is failed and about to
+        # be quarantined), read back by the CPU. The page is restored after.
         retry = []
         for k in pages[:4]:
             lo = max(0, k * page - off0)
             hi = min(flat_c.numel(), (k + 1) * page - off0)
+            keep = flat_c[lo:hi].clone()
             up = flat_c[lo:hi].to(loaded.device)
-            down = flat_l[lo:hi].cpu()
             torch.accelerator.synchronize(loaded.device)
+            up_ok = torch.equal(up.cpu(), keep)
+            pattern = torch.arange(hi - lo, dtype=torch.int64, device=loaded.device)
+            pattern = (pattern * 7 + 3).to(flat_c.dtype)
+            flat_c[lo:hi].copy_(pattern)
+            torch.accelerator.synchronize(loaded.device)
+            down_ok = torch.equal(flat_c[lo:hi], pattern.cpu())
+            flat_c[lo:hi].copy_(keep)
             retry.append(
-                f"{k}:up={'ok' if torch.equal(up.cpu(), flat_c[lo:hi]) else 'BAD'}"
-                f",down={'ok' if torch.equal(down, flat_c[lo:hi]) else 'BAD'}"
+                f"{k}:up={'ok' if up_ok else 'BAD'},down={'ok' if down_ok else 'BAD'}"
             )
         logger.warning(
             "SimpleCPU recheck pages rank=%d event=%d pos=%d region=%s: %d of %d "
