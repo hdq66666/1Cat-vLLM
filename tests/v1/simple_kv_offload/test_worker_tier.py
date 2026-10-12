@@ -62,9 +62,20 @@ def make_worker() -> Iterator[Callable[..., SimpleCPUOffloadWorker]]:
     workers: list[SimpleCPUOffloadWorker] = []
 
     def factory(
-        extra_kv_tensors: tuple[KVCacheTensor, ...] = (), **options
+        extra_kv_tensors: tuple[KVCacheTensor, ...] = (),
+        attn_layout: str = "kv_outer",
+        **options,
     ) -> SimpleCPUOffloadWorker:
-        attn = torch.zeros(2, NUM_GPU_BLOCKS, 16, 8, dtype=torch.float16, device="cuda")
+        if attn_layout == "kv_outer":
+            attn = torch.zeros(
+                2, NUM_GPU_BLOCKS, 16, 8, dtype=torch.float16, device="cuda"
+            )
+        else:
+            # Paged like FlashAttention on the hybrid model: two 4-token
+            # pages of (K, V) per block, 256 B per block as well.
+            attn = torch.zeros(
+                NUM_GPU_BLOCKS * 2, 2, 4, 8, dtype=torch.float16, device="cuda"
+            )
         mamba = torch.zeros(NUM_GPU_BLOCKS, 64, dtype=torch.float32, device="cuda")
         kv_cache_config = KVCacheConfig(
             num_blocks=NUM_GPU_BLOCKS,
@@ -1033,3 +1044,24 @@ def test_copy_mode_switches_at_run_time(make_worker) -> None:
     )
     with pytest.raises(ValueError, match="not available"):
         backend.set_mode("bogus")
+
+
+def test_typed_views_of_paged_attention(make_worker):
+    """A (blocks * pages, 2, ...) attention cache gets K and V views over
+    every page of a block; damaging V of one block touches only the V half
+    of its pages."""
+    worker = make_worker(attn_layout="paged", fingerprint=True)
+    fp = worker._fp
+    assert fp is not None
+    r = fp.names.index("attn.0")
+    parts = {part: view for part, view, _ in fp._parts[r]}
+    assert set(parts) == {"k", "v"}
+    assert parts["k"].shape == (NUM_GPU_BLOCKS, 2, 32)
+    cviews = {part: cview for part, _, cview in fp._parts[r]}
+    assert cviews["v"] is not None and cviews["v"].shape[1:] == (2, 32)
+    parts["v"][3].fill_(float("nan"))
+    row = worker.gpu_kv_caches["attn.0"][3].view(torch.float16).view(2, 2, 32)
+    assert torch.isnan(row[:, 1]).all()
+    assert not torch.isnan(row[:, 0]).any()
+    other = worker.gpu_kv_caches["attn.0"][2].view(torch.float16)
+    assert not torch.isnan(other).any()

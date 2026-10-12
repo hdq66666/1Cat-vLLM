@@ -383,8 +383,8 @@ class SimpleCPUOffloadWorker:
         """Typed [blocks, ...] views of every registered region and of its
         CPU mirror, tagged with what the region holds (fingerprint
         REGION_PARTS): K and V of an attention layer whose cache is laid out
-        (blocks, 2, ...) or (2, blocks, ...), a whole attention region
-        otherwise, or each state tensor of a state-space layer. Also the KV
+        (blocks * pages, 2, ...) or (2, blocks, ...), a whole attention
+        region otherwise, or each state tensor of a state-space layer. Also the KV
         cache group of every region and the groups of the state-space
         layers, so the chain counts a block only in its owner's regions.
         Without KV cache groups the layout decides (a list of tensors is a
@@ -471,14 +471,17 @@ class SimpleCPUOffloadWorker:
             cpu = self.cpu_kv_caches[name]
             if (
                 value.dim() >= 2
-                and value.shape[0] == num_blocks
+                and value.shape[0] % num_blocks == 0
                 and value.shape[1] == 2
             ):
-                # (blocks, 2, ...): K and V halves of one region.
-                flat = value.view(num_blocks, 2, -1)
-                cflat = cpu.view(value.dtype).view(cpu.shape[0], 2, -1)
-                gpu_views[name] = [("k", flat[:, 0]), ("v", flat[:, 1])]
-                cpu_views[name] = [("k", cflat[:, 0]), ("v", cflat[:, 1])]
+                # (blocks * pages, 2, ...): K and V of every page of a block
+                # (the attention backend may page a block in smaller units,
+                # e.g. 51 pages of 16 tokens per 816-token block).
+                pages = value.shape[0] // num_blocks
+                paged = value.view(num_blocks, pages, 2, -1)
+                cpaged = cpu.view(value.dtype).view(cpu.shape[0], pages, 2, -1)
+                gpu_views[name] = [("k", paged[:, :, 0]), ("v", paged[:, :, 1])]
+                cpu_views[name] = [("k", cpaged[:, :, 0]), ("v", cpaged[:, :, 1])]
             else:
                 gpu_views[name] = [("attn", value.view(num_blocks, -1))]
                 cpu_views[name] = [
@@ -950,7 +953,7 @@ class SimpleCPUOffloadWorker:
                 cpu_row = self.cpu_kv_caches[name][cid]
                 loaded = gpu_region[gid]
                 plain = cpu_row.to(loaded.device)
-                torch.cuda.synchronize(loaded.device)
+                torch.accelerator.synchronize(loaded.device)
                 if not torch.equal(plain.cpu(), cpu_row):
                     plain_ok = False
                 if not torch.equal(plain, loaded):
