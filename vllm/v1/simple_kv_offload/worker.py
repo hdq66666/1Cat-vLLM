@@ -954,14 +954,19 @@ class SimpleCPUOffloadWorker:
                 loaded = gpu_region[gid]
                 plain = cpu_row.to(loaded.device)
                 torch.accelerator.synchronize(loaded.device)
-                if not torch.equal(plain.cpu(), cpu_row):
+                pc = plain.cpu()
+                vs_cpu = not torch.equal(pc, cpu_row)
+                vs_loaded = not torch.equal(plain, loaded)
+                if vs_cpu:
                     plain_ok = False
-                if not torch.equal(plain, loaded):
+                if vs_loaded:
                     differing.append(name)
-                    if first is None:
-                        first = name
                     ff_loaded += int((loaded == -1).sum())
                     ff_plain += int((plain == -1).sum())
+                if (vs_cpu or vs_loaded) and first is None:
+                    first = name
+                if vs_cpu or vs_loaded:
+                    self._recheck_pages(event_idx, i, name, cpu_row, loaded, plain, pc)
             gpas = ""
             if first is not None:
                 row = self.cpu_kv_caches[first][cid]
@@ -1007,6 +1012,91 @@ class SimpleCPUOffloadWorker:
                 ].data_ptr(),
                 gpas,
             )
+
+    def _recheck_pages(
+        self,
+        event_idx: int,
+        pos: int,
+        name: str,
+        cpu_row: torch.Tensor,
+        loaded: torch.Tensor,
+        plain: torch.Tensor,
+        pc: torch.Tensor,
+    ) -> None:
+        """Page-level view of one region of a bad row: the 4 KiB pages (of
+        the CPU row's virtual pages) where the plain copy read through the
+        GPU differs from what the CPU reads (pc vs cpu_row) or from the
+        loaded block, each with its guest-physical address, the number of
+        differing bytes, whether the GPU bytes are all ones, and a sample of
+        (offset: cpu byte -> gpu byte). For the first four pages a copy of
+        just that page is tried again, up and down, against the CPU bytes."""
+        import struct
+
+        page = 4096
+        base = cpu_row.data_ptr()
+        off0 = base % page
+        flat_c = cpu_row.view(-1)
+        flat_p = pc.view(-1)
+        flat_l = loaded.view(-1)
+        diff_cpu = (flat_p != flat_c).nonzero().flatten()
+        diff_load = (plain.view(-1) != flat_l).nonzero().flatten().cpu()
+        if diff_cpu.numel() == 0 and diff_load.numel() == 0:
+            return
+        pages = sorted(
+            set(((diff_cpu + off0) // page).tolist())
+            | set(((diff_load + off0) // page).tolist())
+        )
+        total = (off0 + flat_c.numel() * flat_c.element_size() + page - 1) // page
+        gpas: dict[int, int] = {}
+        try:
+            with open("/proc/self/pagemap", "rb") as pm:
+                for k in pages:
+                    pm.seek((base // page + k) * 8)
+                    e = struct.unpack("<Q", pm.read(8))[0]
+                    gpas[k] = (e & ((1 << 55) - 1)) * page if (e >> 63) & 1 else -1
+        except OSError:
+            pass
+        desc = []
+        for k in pages[:24]:
+            lo = max(0, k * page - off0)
+            hi = min(flat_c.numel(), (k + 1) * page - off0)
+            c, g = flat_c[lo:hi], flat_p[lo:hi]
+            nd = (c != g).nonzero().flatten()
+            nbad_cpu = int(nd.numel())
+            nbad_load = int((plain.view(-1)[lo:hi] != flat_l[lo:hi]).sum())
+            ones = bool((g == -1).all())
+            sample = " ".join(
+                f"{int(o)}:{int(c[o]) & 0xFF:02x}->{int(g[o]) & 0xFF:02x}"
+                for o in nd[:4].tolist()
+            )
+            desc.append(
+                f"[page {k} gpa {gpas.get(k, -1):#x}: vs_cpu {nbad_cpu}B"
+                f"{' ones' if ones else ''} vs_loaded {nbad_load}B {sample}]"
+            )
+        retry = []
+        for k in pages[:4]:
+            lo = max(0, k * page - off0)
+            hi = min(flat_c.numel(), (k + 1) * page - off0)
+            up = flat_c[lo:hi].to(loaded.device)
+            down = flat_l[lo:hi].cpu()
+            torch.accelerator.synchronize(loaded.device)
+            retry.append(
+                f"{k}:up={'ok' if torch.equal(up.cpu(), flat_c[lo:hi]) else 'BAD'}"
+                f",down={'ok' if torch.equal(down, flat_c[lo:hi]) else 'BAD'}"
+            )
+        logger.warning(
+            "SimpleCPU recheck pages rank=%d event=%d pos=%d region=%s: %d of %d "
+            "pages differ %s%s; single-page recopy %s",
+            _global_rank(),
+            event_idx,
+            pos,
+            name,
+            len(pages),
+            total,
+            " ".join(desc),
+            " ..." if len(pages) > 24 else "",
+            " ".join(retry),
+        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid, self._invalid_block_ids = self._invalid_block_ids, set()
