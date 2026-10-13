@@ -4,8 +4,10 @@
 
 import contextlib
 import time
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from math import gcd
 from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
@@ -19,7 +21,12 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
-from vllm.v1.core.kv_cache_utils import get_group_id
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    get_block_hash,
+    get_group_id,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -44,7 +51,13 @@ from vllm.v1.simple_kv_offload.stats import (
     LOAD_DST_YOUNG,
     LOAD_FAILED_BLOCKS,
     LOAD_FAILED_REQUESTS,
+    LOAD_PROTECTED_BLOCKS,
     LOAD_REQUESTS,
+    PROTECT_CAPPED,
+    PROTECT_EXPIRED,
+    PROTECT_GRANTED,
+    PROTECTED_CPU_BLOCKS_LAST,
+    PROTECTED_HASHES_LAST,
     QUARANTINE_FALLBACKS_LAST,
     QUARANTINE_SKIPPED,
     RESERVE_STOPS,
@@ -72,6 +85,10 @@ REFUSED_HIT_LOG_INTERVAL_S = 60.0
 # A load destination freed by a request that finished within this many
 # scheduler steps counts as LOAD_DST_RECENTLY_FREED.
 RECENTLY_FREED_STEPS = 2
+# Prefix protection: seconds between two summary lines, and between two
+# sweeps of the hit history for hashes not hit within the window.
+PROTECT_LOG_INTERVAL_S = 60.0
+PROTECT_PRUNE_INTERVAL_S = 60.0
 
 
 def _ranges(ids: list[int]) -> str:
@@ -328,6 +345,52 @@ class SimpleCPUOffloadScheduler:
         # Lazy mode: the last walk stopped before the end of the free queue
         # with blocks left to store (keeps an idle engine stepping).
         self._lazy_backlog = False
+        # Prefix protection (options.protect_hits > 0, lazy mode): see
+        # _count_prefix_hit(). A request hash covers hash_block_size tokens;
+        # a block of group g carries the hashes of _protect_groups[g] of them
+        # and is protected under the last one. Hits are counted for every
+        # _protect_stride-th request hash, the ends of the smallest blocks.
+        self._protect_on = lazy_offload and self.options.protect_hits > 0
+        self._protect_groups: list[tuple[int, int]] = [
+            (gid, group.kv_cache_spec.block_size // hash_block_size)
+            for gid, group in enumerate(self.cpu_kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+        ]
+        self._protect_stride = max(1, gcd(*(span for _, span in self._protect_groups)))
+        self._protect_max_pins = int(
+            self.options.protect_max_fraction * self.num_cpu_blocks
+        )
+        # Request hash -> times of its last protect_hits + 1 hits.
+        self._hit_times: dict[BlockHash, deque[float]] = {}
+        # Protected request hash -> expiry, in expiry order (oldest first).
+        self._protected: dict[BlockHash, float] = {}
+        # CPU blocks held (one extra reference each) for a protected hash,
+        # and CPU block id -> the hash it is held for.
+        self._protect_pins: dict[BlockHash, list[KVCacheBlock]] = {}
+        self._protect_pin_ids: dict[int, BlockHash] = {}
+        # Request id -> tokens it found in the GPU prefix cache, between
+        # get_num_new_matched_tokens() and update_state_after_alloc().
+        self._local_hit_tokens: dict[str, int] = {}
+        # Bytes of one request hash (known from the first counted request).
+        self._hash_len = 0
+        self._next_protect_log = 0.0
+        self._next_hit_prune = 0.0
+        # Granted / expired / given up since the last summary line.
+        self._protect_log_counts = [0, 0, 0]
+        if self._protect_on:
+            logger.info(
+                "SimpleCPU protect enabled: a prefix hit more than %d times "
+                "within %.0f s is kept for %.0f s (refresh_on_hit=%s), at most "
+                "%d of %d CPU blocks; hits counted every %d tokens",
+                self.options.protect_hits,
+                self.options.protect_window_s,
+                self.options.protect_ttl_s,
+                self.options.protect_refresh_on_hit,
+                self._protect_max_pins,
+                self.num_cpu_blocks,
+                self._protect_stride * hash_block_size,
+            )
+
         # GPU block id -> (hash, allocation generation) of the content it
         # holds that was already written to (or read from) CPU. An entry only
         # matches within the residency it was recorded in, even if a later
@@ -435,6 +498,8 @@ class SimpleCPUOffloadScheduler:
         # is dropped first.
         if stale := self._pending_cpu_hits.pop(request.request_id, None):
             self._free_pending_cpu_hit(stale)
+        if self._protect_on:
+            self._local_hit_tokens[request.request_id] = num_computed_tokens
 
         # Requests that bypass the GPU prefix cache (e.g. prompt_logprobs)
         # must compute every prompt token: no CPU hit either.
@@ -742,6 +807,13 @@ class SimpleCPUOffloadScheduler:
         block_ids_by_group = blocks.get_block_ids()
         num_groups = len(block_ids_by_group)
 
+        if self._protect_on:
+            # Only the call that follows get_num_new_matched_tokens() counts:
+            # a request that waited for a load comes through here again.
+            num_local_tokens = self._local_hit_tokens.pop(req_id, None)
+            if num_local_tokens is not None and request.num_preemptions == 0:
+                self._count_prefix_hit(request, num_local_tokens + num_external_tokens)
+
         # Store tracking (eager mode only). Register the request;
         # block IDs are accumulated from scheduler_output in
         # _prepare_eager_store_specs via yield_req_data.
@@ -904,6 +976,18 @@ class SimpleCPUOffloadScheduler:
                 ),
             )
 
+        if self._protect_pin_ids:
+            num_protected = sum(cid in self._protect_pin_ids for cid in cpu_block_ids)
+            if num_protected:
+                self._stats.add(LOAD_PROTECTED_BLOCKS, num_protected)
+                logger.info(
+                    "SimpleCPU protect: load req=%s takes %d of %d blocks from "
+                    "protected copies",
+                    req_id,
+                    num_protected,
+                    len(cpu_block_ids),
+                )
+
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
             request=request,
@@ -921,6 +1005,8 @@ class SimpleCPUOffloadScheduler:
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
         self._maybe_check_host_mem()
+        if self._protect_on:
+            self._protect_tick()
         self._num_running_last_step = len(scheduler_output.num_scheduled_tokens)
         if self._gpu_block_pool is not None:
             self._gpu_block_pool.current_step = self._num_steps
@@ -1156,9 +1242,14 @@ class SimpleCPUOffloadScheduler:
                 pass
             elif bhash in self._lazy_inflight_hashes:
                 stats.add(INFLIGHT_SKIPPED)
-            elif skip_restore and self._gpu_offloaded.get(node.block_id) == (
-                bhash,
-                node.alloc_generation,
+            elif (
+                skip_restore
+                and self._gpu_offloaded.get(node.block_id)
+                == (bhash, node.alloc_generation)
+                # A protected prefix whose CPU copy was evicted before it
+                # became protected is stored again (busy steps only, like
+                # allow_restore): its new copy is held, so this ends.
+                and (is_idle or not self._is_protected(bhash))
             ):
                 stats.add(RESTORE_SKIPPED)
             else:
@@ -1421,6 +1512,7 @@ class SimpleCPUOffloadScheduler:
             if not bad:
                 continue
             self.cpu_block_pool.evict_blocks({cid for _, cid in bad})
+            self._protect_drop_blocks([cid for _, cid in bad])
             for gid in meta.gpu_block_ids:
                 self._gpu_offloaded.pop(gid, None)
             self._stats.add(LOAD_FAILED_REQUESTS)
@@ -1445,6 +1537,7 @@ class SimpleCPUOffloadScheduler:
             return
         blocks = [self.cpu_block_pool.blocks[bid] for bid in new]
         self.cpu_block_pool.evict_blocks(set(new))
+        self._protect_drop_blocks(new)
         self.cpu_block_pool.touch(blocks)
         self._quarantined.update(new)
         self._stats.add(CPU_BLOCKS_QUARANTINED, len(new))
@@ -1498,6 +1591,8 @@ class SimpleCPUOffloadScheduler:
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
+        if self._protected and self._protect_pin_blocks(cpu_blocks):
+            self._protect_enforce_budget()
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
@@ -1529,6 +1624,7 @@ class SimpleCPUOffloadScheduler:
         self._pending_cpu_hits.clear()
         self._deferred_hits.clear()
         self._cold_fallback_req_ids.clear()
+        self._protect_clear()
         self._cursor = None
         self._gpu_offloaded.clear()
         self._lazy_inflight_hashes.clear()
@@ -1554,10 +1650,209 @@ class SimpleCPUOffloadScheduler:
             CPU_CACHED_BLOCKS_LAST,
             len(self.cpu_block_pool.cached_block_hash_to_block),
         )
+        if self._protect_on:
+            stats.add(PROTECTED_HASHES_LAST, len(self._protected))
+            stats.add(PROTECTED_CPU_BLOCKS_LAST, len(self._protect_pin_ids))
         if stats.is_empty():
             stats.reset()
             return None
         return stats.clone_and_reset()
+
+    # ------------------------------------------------------------------
+    # Prefix protection
+    # ------------------------------------------------------------------
+    def _count_prefix_hit(self, request: "Request", num_hit_tokens: int) -> None:
+        """Count one hit on every block of the prefix a newly scheduled
+        request found cached (GPU prefix cache plus CPU tier), and protect
+        the blocks that were hit more than protect_hits times within
+        protect_window_s seconds.
+
+        A hit on a block is a hit on all blocks before it, so the protected
+        hashes of a prompt always form a prefix of it. The CPU copies of a
+        protected hash are held with an extra reference (see
+        _protect_pin_blocks) until its protection expires.
+        """
+        if num_hit_tokens <= 0:
+            return
+        if self._use_eagle:
+            # With EAGLE/MTP a hit stops one block short of what the caches
+            # hold (the last matched block is recomputed), so that block is
+            # part of what served the hit and must survive with it. Where it
+            # is not shared, it never reaches the hit rate.
+            num_hit_tokens += self.block_size
+        hashes = request.block_hashes
+        stride = self._protect_stride
+        num_hashes = min(num_hit_tokens // self.hash_block_size, len(hashes))
+        num_hashes -= num_hashes % stride
+        if num_hashes <= 0:
+            return
+        if not self._hash_len:
+            self._hash_len = len(hashes[0])
+        opts = self.options
+        now = self._clock()
+        self._protect_expire(now)
+        need = opts.protect_hits + 1
+        expiry = now + opts.protect_ttl_s
+        granted = 0
+        # Deepest block first: the prefix head ends up last in the expiry
+        # order, so it expires and is given up for the budget last.
+        for idx in range(num_hashes - 1, -1, -stride):
+            key = hashes[idx]
+            times = self._hit_times.get(key)
+            if times is None:
+                times = self._hit_times[key] = deque(maxlen=need)
+            times.append(now)
+            known = key in self._protected
+            hot = len(times) == need and now - times[0] <= opts.protect_window_s
+            if not hot and not (known and opts.protect_refresh_on_hit):
+                continue
+            if known:
+                del self._protected[key]
+            self._protected[key] = expiry
+            if not known:
+                granted += 1
+                self._protect_pin_existing(hashes, idx)
+        if granted:
+            self._stats.add(PROTECT_GRANTED, granted)
+            self._protect_log_counts[0] += granted
+            self._protect_enforce_budget()
+
+    def _protect_key(self, bhash: "BlockHashWithGroupId") -> BlockHash | None:
+        """The request hash a cached block is protected under: the hash of
+        the last hash block it spans."""
+        if not self._hash_len:
+            return None
+        return BlockHash(get_block_hash(bhash)[-self._hash_len :])
+
+    def _is_protected(self, bhash: "BlockHashWithGroupId") -> bool:
+        if not self._protected:
+            return False
+        key = self._protect_key(bhash)
+        return key is not None and self._protected.get(key, 0.0) > self._clock()
+
+    def _protect_pin_existing(self, hashes: Sequence[BlockHash], idx: int) -> None:
+        """Hold the CPU copies (one per group whose block ends at request
+        hash idx) that a newly protected hash already has."""
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        found = []
+        for group_id, span in self._protect_groups:
+            if (idx + 1) % span:
+                continue
+            block_hash = BlockHash(b"".join(hashes[idx + 1 - span : idx + 1]))
+            block = cached.get_one_block(
+                make_block_hash_with_group_id(block_hash, group_id)
+            )
+            if block is not None:
+                found.append(block)
+        self._protect_pin_blocks(found)
+
+    def _protect_pin_blocks(self, blocks: Sequence["KVCacheBlock"]) -> int:
+        """Take an extra reference on the cached CPU blocks whose hash is
+        protected, which keeps them off the free queue: the allocator cannot
+        evict them, loads still find them. Returns how many were taken."""
+        now = self._clock()
+        num_pinned = 0
+        for block in blocks:
+            bhash = block.block_hash
+            if (
+                bhash is None
+                or block.is_null
+                or block.block_id in self._protect_pin_ids
+                or block.block_id in self._quarantined
+            ):
+                continue
+            key = self._protect_key(bhash)
+            if key is None or self._protected.get(key, 0.0) <= now:
+                continue
+            self.cpu_block_pool.touch([block])
+            self._protect_pins.setdefault(key, []).append(block)
+            self._protect_pin_ids[block.block_id] = key
+            num_pinned += 1
+        return num_pinned
+
+    def _unprotect(self, key: BlockHash) -> None:
+        """End the protection of a hash: its CPU copies return to the MRU
+        end of the LRU as ordinary cached blocks."""
+        self._protected.pop(key, None)
+        blocks = self._protect_pins.pop(key, None)
+        if blocks:
+            for block in blocks:
+                del self._protect_pin_ids[block.block_id]
+            self.cpu_block_pool.free_blocks(blocks)
+
+    def _protect_enforce_budget(self) -> None:
+        """Give up the protections that would expire first while more than
+        protect_max_fraction of the CPU blocks are held."""
+        capped = 0
+        while self._protected and len(self._protect_pin_ids) > self._protect_max_pins:
+            self._unprotect(next(iter(self._protected)))
+            capped += 1
+        if capped:
+            self._stats.add(PROTECT_CAPPED, capped)
+            self._protect_log_counts[2] += capped
+
+    def _protect_expire(self, now: float) -> None:
+        expired = 0
+        while self._protected:
+            key = next(iter(self._protected))
+            if self._protected[key] > now:
+                break
+            self._unprotect(key)
+            expired += 1
+        if expired:
+            self._stats.add(PROTECT_EXPIRED, expired)
+            self._protect_log_counts[1] += expired
+
+    def _protect_drop_blocks(self, cpu_block_ids: Iterable[int]) -> None:
+        """Release the hold on CPU blocks that leave the prefix cache for
+        another reason (a failed gated load, quarantine)."""
+        for block_id in cpu_block_ids:
+            key = self._protect_pin_ids.pop(block_id, None)
+            if key is None:
+                continue
+            block = self.cpu_block_pool.blocks[block_id]
+            held = self._protect_pins[key]
+            held.remove(block)
+            if not held:
+                del self._protect_pins[key]
+            self.cpu_block_pool.free_blocks([block])
+
+    def _protect_clear(self) -> None:
+        """Forget every protection and hit count (prefix cache reset)."""
+        for blocks in self._protect_pins.values():
+            self.cpu_block_pool.free_blocks(blocks)
+        self._protect_pins.clear()
+        self._protect_pin_ids.clear()
+        self._protected.clear()
+        self._hit_times.clear()
+
+    def _protect_tick(self) -> None:
+        """Once per step: expire protections, forget hit histories that
+        can no longer reach the hit rate, and log a summary of changes."""
+        now = self._clock()
+        self._protect_expire(now)
+        if now >= self._next_hit_prune:
+            self._next_hit_prune = now + PROTECT_PRUNE_INTERVAL_S
+            oldest = now - self.options.protect_window_s
+            stale = [k for k, times in self._hit_times.items() if times[-1] < oldest]
+            for key in stale:
+                del self._hit_times[key]
+        if any(self._protect_log_counts) and now >= self._next_protect_log:
+            self._next_protect_log = now + PROTECT_LOG_INTERVAL_S
+            granted, expired, capped = self._protect_log_counts
+            self._protect_log_counts = [0, 0, 0]
+            logger.info(
+                "SimpleCPU protect: +%d protected, %d expired, %d given up for "
+                "the budget; now %d block hashes protected, %d of %d CPU blocks "
+                "held (budget %d)",
+                granted,
+                expired,
+                capped,
+                len(self._protected),
+                len(self._protect_pin_ids),
+                self.num_cpu_blocks,
+                self._protect_max_pins,
+            )
 
     def request_finished(
         self,
@@ -1618,6 +1913,7 @@ class SimpleCPUOffloadScheduler:
             self._free_pending_cpu_hit(pending)
         self._deferred_hits.pop(req_id, None)
         self._cold_fallback_req_ids.discard(req_id)
+        self._local_hit_tokens.pop(req_id, None)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)

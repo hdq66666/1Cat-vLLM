@@ -103,6 +103,20 @@ class SimpleCPUOffloadOptions:
     # Margin of free GPU blocks kept for the running requests when admitting
     # a CPU hit. None = one block per request scheduled in the last step.
     cpu_hit_admission_margin_blocks: int | None = None
+    # Prefix protection (lazy mode). A prefix that more than protect_hits
+    # requests hit (GPU prefix cache or CPU tier) within protect_window_s
+    # seconds is protected for protect_ttl_s seconds: its CPU copies are
+    # held out of the LRU, so traffic that turns the tier over in the
+    # meantime cannot evict them. 0 = off. With protect_refresh_on_hit every
+    # later hit on a protected prefix restarts its time to live; without it
+    # only meeting the hit rate again does. At most protect_max_fraction of
+    # the CPU blocks are held this way; beyond that the protection that
+    # would expire first is given up.
+    protect_hits: int = 0
+    protect_window_s: float = 600.0
+    protect_ttl_s: float = 86400.0
+    protect_max_fraction: float = 0.25
+    protect_refresh_on_hit: bool = True
 
     def cpu_bytes_per_rank(self, world_size: int) -> int:
         if self.cpu_bytes_to_use_per_rank is not None:
@@ -171,6 +185,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         "log_transfer_blocks",
         "fingerprint",
         "allow_request_directives",
+        "protect_refresh_on_hit",
     ):
         if key in cfg:
             kwargs[key] = _as_bool(key, cfg[key])
@@ -194,6 +209,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         "debug_gpu_sleep_cycles",
         "fingerprint_inject_gpu_load",
         "fingerprint_inject_cpu_load",
+        "protect_hits",
     ):
         if cfg.get(key) is not None:
             kwargs[key] = _as_int(key, cfg[key], 0)
@@ -207,9 +223,17 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         ("cpu_hit_admission_max_wait_s", 0.0),
         ("debug_host_sleep_ms", 0.0),
         ("fingerprint_gate_timeout_s", 0.0),
+        ("protect_window_s", 1.0),
+        ("protect_ttl_s", 1.0),
+        ("protect_max_fraction", 0.0),
     ):
         if key in cfg:
             kwargs[key] = _as_float(key, cfg[key], minimum)
+    if kwargs.get("protect_max_fraction", 0.0) > 0.9:
+        raise ValueError(
+            "kv_connector_extra_config['protect_max_fraction'] must be <= 0.9, "
+            f"got {kwargs['protect_max_fraction']}"
+        )
     if cfg.get("fingerprint_corrupt_plan"):
         from vllm.v1.simple_kv_offload.fingerprint import parse_corrupt_plan
 

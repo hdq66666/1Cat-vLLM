@@ -60,6 +60,16 @@ QUARANTINE_FALLBACKS_LAST = "alloc_quarantine_fallback_blocks_last"
 CPU_HITS_DEFERRED = "cpu_hit_deferred_steps"
 CPU_HITS_COLD_FALLBACK = "cpu_hit_cold_fallbacks"
 CPU_HIT_WAIT_S_MAX = "cpu_hit_wait_s_max"
+# Prefix protection: block hashes that became protected, whose protection
+# expired or was given up for the protect_max_fraction budget, CPU blocks a
+# load took from protected copies, and the current protected hashes and the
+# CPU blocks held for them.
+PROTECT_GRANTED = "protect_granted_hashes"
+PROTECT_EXPIRED = "protect_expired_hashes"
+PROTECT_CAPPED = "protect_capped_hashes"
+LOAD_PROTECTED_BLOCKS = "load_protected_blocks"
+PROTECTED_HASHES_LAST = "protected_hashes_last"
+PROTECTED_CPU_BLOCKS_LAST = "protected_cpu_blocks_last"
 STORE_PINS_LAST = "store_pinned_gpu_blocks_last"
 CPU_USED_BLOCKS_LAST = "cpu_used_blocks_last"
 CPU_CACHED_BLOCKS_LAST = "cpu_cached_blocks_last"
