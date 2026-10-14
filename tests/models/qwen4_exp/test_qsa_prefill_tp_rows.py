@@ -81,3 +81,51 @@ def test_tp_rows_fall_back_outside_the_admitted_chunk_sizes(rows):
     actual = _select(args, rank)
     assert rank.calls == 0
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _two_request_inputs(prefill_rows: int, context: int, other_rows: int, seed=1):
+    """A prefill chunk next to a short second request (the paged scorer)."""
+    torch.manual_seed(seed)
+    page = 16
+    pages = (context // 4) // page
+    other_context = 8192
+    other_pages = (other_context // 4) // page
+    rows = prefill_rows + other_rows
+    q = torch.randn(rows, 4, 128, device="cuda", dtype=torch.float16)
+    k_cache = torch.randn(
+        pages + other_pages + 3, page, 1, 128, device="cuda", dtype=torch.float16
+    )
+    order = torch.randperm(pages + other_pages + 3, device="cuda", dtype=torch.int32)
+    page_table = torch.full((2, pages), 0, device="cuda", dtype=torch.int32)
+    page_table[0] = order[:pages]
+    page_table[1, :other_pages] = order[pages : pages + other_pages]
+    token_to_req = torch.cat(
+        (
+            torch.zeros(prefill_rows, dtype=torch.int32, device="cuda"),
+            torch.ones(other_rows, dtype=torch.int32, device="cuda"),
+        )
+    )
+    query_positions = torch.cat(
+        (
+            torch.arange(context - prefill_rows, context, device="cuda"),
+            torch.arange(other_context - other_rows, other_context, device="cuda"),
+        )
+    ).to(torch.int32)
+    sequence_lengths = torch.tensor(
+        [context, other_context], device="cuda", dtype=torch.int32
+    )
+    return (q, k_cache, page_table, token_to_req, query_positions, sequence_lengths)
+
+
+@pytest.mark.parametrize("prefill_rows,other_rows", [(8160, 32), (6528, 10)])
+def test_tp_rows_partition_the_paged_scorer_of_mixed_steps(prefill_rows, other_rows):
+    args = _two_request_inputs(prefill_rows, 40960, other_rows)
+    expected = _select(args)
+    store: dict = {}
+    ranks = [_FakeRank(r, store) for r in range(4)]
+    for rank in ranks:
+        _select(args, rank)
+    outs = [_select(args, rank) for rank in ranks]
+    assert all(rank.calls == 2 for rank in ranks)
+    for out in outs:
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)

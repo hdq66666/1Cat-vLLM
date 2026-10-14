@@ -1475,6 +1475,9 @@ def qsa_select_paged_tokens(
             score_columns = capacity_columns
             all_visible = None
     tp_step = 0
+    # Rows the scorer sees; the expansion always uses the full batch.
+    score_token_to_req = token_to_req
+    score_positions = query_positions
     if (
         tp_group is not None
         and tp_group.world_size == 4
@@ -1482,23 +1485,30 @@ def qsa_select_paged_tokens(
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
-        and contiguous_keys is not None
         and not torch.cuda.is_current_stream_capturing()
     ):
         step = triton.cdiv(rows, tp_group.world_size)
         smallest_partition = rows - (tp_group.world_size - 1) * step
-        if smallest_partition >= _SM70_INDEXER_CUBLAS_MIN_ROWS and (
-            _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+        # The single-request cuBLAS scorer keeps upstream's work gate. The
+        # paged scorer (several requests in the step, e.g. a prefill chunk
+        # next to decodes) is row-independent as well and partitions as is.
+        if contiguous_keys is None or (
+            smallest_partition >= _SM70_INDEXER_CUBLAS_MIN_ROWS
+            and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
         ):
             tp_step = step
             first = tp_group.rank_in_group * step
             last = min(first + step, rows)
             q = q[first:last]
-            assert all_visible is not None
-            all_visible = all_visible[first:last]
+            if all_visible is not None:
+                all_visible = all_visible[first:last]
+            score_token_to_req = token_to_req[first:last]
+            score_positions = query_positions[first:last]
             rows = last - first
             logger.info_once(
-                "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
+                "Using SM70 QSA TP4 prefill row partition with block-index "
+                "AllGather (%s scorer).",
+                "cuBLAS" if contiguous_keys is not None else "paged",
             )
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
@@ -1524,8 +1534,8 @@ def qsa_select_paged_tokens(
                 q[row_slice],
                 k_cache,
                 page_table,
-                token_to_req[row_slice],
-                query_positions[row_slice],
+                score_token_to_req[row_slice],
+                score_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
             )
