@@ -2202,12 +2202,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     has_initial_states_p,
                 )
             )
-            and state_indices_tensor_p.is_contiguous()
-            and has_initial_states_p.is_contiguous()
         ):
             # Read request rows and the old state in place instead of building
-            # the padded channels-first history (about 2x the batch in
-            # temporaries, which startup profiling does not see).
+            # the padded history, which is num_prefills x the longest chunk x
+            # 10240 channels several times over and not in the startup profile.
+            # In align mode the state slots are column 0 of a (requests,
+            # 1 + speculative blocks) table: a strided view as soon as a step
+            # holds two prefills. The kernel reads them with unit stride, so
+            # pass contiguous copies (a few int32/bool values) instead of
+            # falling back.
             from vllm.model_executor.kernels.ple.short_conv import (
                 dilated_prefill_short_conv,
             )
@@ -2220,8 +2223,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 conv_state,
                 conv_weights,
                 q_starts,
-                state_indices_tensor_p[:num_prefills],
-                has_initial_states_p[:num_prefills],
+                state_indices_tensor_p[:num_prefills].contiguous(),
+                has_initial_states_p[:num_prefills].contiguous(),
                 max_len,
                 0,
                 self.short_conv_dilation,

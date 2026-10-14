@@ -330,3 +330,65 @@ def test_sm70_prefill_convolution_changed_input_graph_and_continuation(transpose
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert torch.equal(state, reference_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lengths", [[8160, 32], [40, 3, 17]])
+def test_sm70_fast_path_takes_strided_state_slots(monkeypatch, lengths):
+    """Align mode hands the prefill slots over as column 0 of a (requests,
+    1 + speculative blocks) table. With two prefills in one step that view is
+    not contiguous; the fast path must still run (the padded fallback holds
+    num_prefills x the longest chunk x 10240 channels several times over)."""
+    from vllm.model_executor.kernels.ple import short_conv
+
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    sm70 = torch.cuda.get_device_capability() == (7, 0)
+    if not sm70:
+        # The admission is SM70 only; the Triton stages run anywhere. Bit
+        # equality with cuDNN's convolution is only established on SM70.
+        monkeypatch.setattr(
+            ple_layer.current_platform, "is_device_capability", lambda *_: True
+        )
+
+    calls = []
+    original = short_conv.dilated_prefill_short_conv
+
+    def spy(*args, **kwargs):
+        calls.append(args[4].is_contiguous())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(short_conv, "dilated_prefill_short_conv", spy)
+    slots = [3, 1, 4][: len(lengths)]
+    module, x, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=lengths,
+        decode_tokens=0,
+        state_indices=slots,
+        has_initial=[True, False, True][: len(lengths)],
+        hidden_size=10240,
+    )
+    metadata, state, weights, contiguous_slots, *rest = args
+    table = torch.full((len(lengths), 5), -7, dtype=torch.int32, device="cuda")
+    table[:, 0] = contiguous_slots
+    strided_slots = table[:, 0]
+    assert not strided_slots.is_contiguous()
+
+    expected_state = state.clone()
+    expected = module._short_conv_dilated_prefill_batched(
+        x, metadata, expected_state, weights, contiguous_slots, *rest
+    )
+    assert calls == []  # flag off: reference path
+    module._prefill_short_conv = True
+    actual = module._short_conv_dilated_prefill_batched(
+        x, metadata, state, weights, strided_slots, *rest
+    )
+    assert calls == [True]
+    if sm70:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        error = (actual.float() - expected.float()).norm(dim=1)
+        scale = expected.float().norm(dim=1).clamp_min(1e-6)
+        assert float((error / scale).max()) <= 1e-3
+    assert torch.equal(state, expected_state)
