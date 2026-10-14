@@ -673,9 +673,10 @@ class SimpleCPUOffloadScheduler:
         # The first compute step after the load: the next prompt chunk (at
         # least the last token on a full hit) plus the lookahead.
         step_tokens = max(request.num_tokens - total_computed, 1)
+        # The scheduler applies long_prefill_token_threshold only while other
+        # requests compete, so a request alone after its load may take the
+        # whole budget: reserve for that.
         step_tokens = min(step_tokens, self._max_num_batched_tokens)
-        if 0 < self._long_prefill_token_threshold < step_tokens:
-            step_tokens = self._long_prefill_token_threshold
         num_tokens_next = min(
             total_computed + step_tokens + self._num_lookahead_tokens, max_model_len
         )
