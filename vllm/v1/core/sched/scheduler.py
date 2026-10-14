@@ -336,6 +336,18 @@ class Scheduler(SchedulerInterface):
             and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
         self.prefill_contention_tokens = envs.VLLM_SM70_PREFILL_CONTENTION_TOKENS
+        if self.need_mamba_block_aligned_split:
+            logger.info(
+                "Mamba-aligned prefill split: %s (retention interval %s, state "
+                "block %s tokens, token budget %d, dense under contention %s, "
+                "prefill cap while decoding %s).",
+                "dense" if self.mamba_state_retention_interval is None else "sparse",
+                self.mamba_state_retention_interval,
+                self.mamba_state_block_size,
+                self.max_num_scheduled_tokens,
+                self.mamba_dense_boundaries_on_contention,
+                self.prefill_contention_tokens or "off",
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
