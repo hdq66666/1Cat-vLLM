@@ -1347,6 +1347,8 @@ def _qsa_mqa_cublas(
             BLOCK_N=256,
             num_warps=4,
         )
+        # The next cuBLAS tile must not retain this tile's score allocation.
+        del scores
     return logits, visible
 
 
@@ -1588,6 +1590,10 @@ def qsa_select_paged_tokens(
                 token_topk,
                 out[row_slice],
             )
+        # Selection and expansion have consumed the scores on the same stream.
+        # Avoid overlapping two full logits tiles on the next iteration,
+        # including the TP4 path whose block ids are gathered below.
+        del logits, visible_blocks
     if tp_step:
         # Gather the compressed block ids, not the four times wider expanded
         # token matrix. Padding is confined to the last rank and discarded.

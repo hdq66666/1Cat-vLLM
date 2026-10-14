@@ -2152,7 +2152,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -2167,13 +2166,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            return torch.empty_like(x_p)
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            return torch.empty_like(x_p)
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
@@ -2237,10 +2236,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
 
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -2251,65 +2246,185 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
-        if self.conv_state_len > 0:
-            if conv_state.shape[0] == 0:
-                state = conv_state.new_zeros(
-                    (num_prefills, hidden_size, self.conv_state_len),
-                    dtype=x_p.dtype,
-                )
-            else:
-                state = conv_state.index_select(0, state_indices)[
-                    ..., : self.conv_state_len
-                ].to(x_p.dtype)
+
+        chunk = self._short_conv_prefill_channel_chunk(
+            num_prefills, max_len, num_prefill_tokens, hidden_size
+        )
+        if chunk is not None:
+            return self._short_conv_dilated_prefill_channel_chunks(
+                x_p=x_p,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=state_indices,
+                valid_state=valid_state,
+                has_initial=has_initial,
+                lengths=lengths,
+                req_indices=req_indices,
+                col_indices=col_indices,
+                num_prefills=num_prefills,
+                max_len=max_len,
+                chunk=chunk,
+            )
+
+        # Every [num_prefills, hidden, max_len] buffer here is as large as the
+        # whole prefill batch, and a batched step runs max_num_seqs full state
+        # blocks (4 x 1,600 tokens x 10,240 channels = 125 MiB each), a pattern
+        # the profiling run never takes. Keep at most two alive: pack the
+        # tokens straight into the channels-first history, take the next state
+        # before the convolution, and free each buffer as soon as it is spent.
+        history = x_p.new_zeros((num_prefills, hidden_size, state_len + max_len))
+        history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p
+        next_state = None
+        if state_len > 0 and conv_state.shape[0] > 0:
+            state = conv_state.index_select(0, state_indices)[..., :state_len].to(
+                x_p.dtype
+            )
             use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
-            initial_state = torch.where(
+            history[..., :state_len] = torch.where(
                 use_initial_mask,
                 state,
                 torch.zeros_like(state),
             )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
-
-        if self.conv_state_len > 0 and conv_state.shape[0] > 0:
             state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
                 num_prefills, 1, 1
             )
             state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
+                state_len, device=history.device, dtype=torch.int64
+            ).view(1, 1, state_len)
             next_state = history.gather(
                 dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
+                index=(state_starts + state_offsets).expand(-1, hidden_size, -1),
             )
+
+        conv_output = F.conv1d(
+            history,
+            conv_weights.unsqueeze(1).contiguous(),
+            groups=hidden_size,
+            dilation=self.short_conv_dilation,
+        )
+        del history
+        F.silu(conv_output, inplace=True)
+        # Only whole rows of requests without a valid state are zeroed: padding
+        # columns past each request's length are never gathered below.
+        conv_output.masked_fill_(
+            ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1), 0
+        )
+        output = conv_output.transpose(1, 2)[req_indices, col_indices]
+        del conv_output
+
+        if next_state is not None:
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
             existing_state = conv_state.index_select(0, state_indices)
-            existing_base_state = existing_state[..., : self.conv_state_len]
+            existing_base_state = existing_state[..., :state_len]
             update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
             safe_next_state = torch.where(
                 update_mask.view(num_prefills, 1, 1),
                 next_state.to(conv_state.dtype),
                 existing_base_state,
             )
-            existing_state[..., : self.conv_state_len] = safe_next_state
+            existing_state[..., :state_len] = safe_next_state
+            conv_state.index_copy_(0, state_indices, existing_state)
+        return output
+
+    def _short_conv_prefill_channel_chunk(
+        self,
+        num_prefills: int,
+        max_len: int,
+        num_prefill_tokens: int,
+        hidden_size: int,
+    ) -> int | None:
+        """Channel chunk width for the batched prefill short-conv, or None.
+
+        Padding every prefill to the longest one can make the packed history
+        several times larger than the step itself, e.g. long chunked prefills
+        next to short prompts. The profiling run never takes that shape, so at
+        max_num_seqs=8 one such step ran out of memory. Keep each padded buffer
+        at most half of one unpadded step by splitting channels; the
+        convolution is depthwise, so per-channel arithmetic is unchanged.
+        Long single prefills also need headroom: keep each temporary at most
+        a quarter of the step instead of retaining two full-sized buffers.
+        """
+        if num_prefills <= 0 or (num_prefills == 1 and max_len < 4096):
+            return None
+        per_channel = num_prefills * (self.conv_state_len + max_len)
+        divisor = 4 if num_prefills == 1 else 2
+        budget = (num_prefill_tokens + self.conv_state_len) * hidden_size // divisor
+        if per_channel * hidden_size <= budget:
+            return None
+        chunk = max(64, (budget // per_channel) // 64 * 64)
+        return chunk if chunk < hidden_size else None
+
+    def _short_conv_dilated_prefill_channel_chunks(
+        self,
+        x_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        state_indices: torch.Tensor,
+        valid_state: torch.Tensor,
+        has_initial: torch.Tensor,
+        lengths: torch.Tensor,
+        req_indices: torch.Tensor,
+        col_indices: torch.Tensor,
+        num_prefills: int,
+        max_len: int,
+        chunk: int,
+    ) -> torch.Tensor:
+        """Same result as the packed prefill path, ``chunk`` channels at a time."""
+        hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
+        output = torch.empty_like(x_p)
+        have_state = state_len > 0 and conv_state.shape[0] > 0
+        if have_state:
+            # Snapshot before any write-back; also the base of the write-back.
+            existing_state = conv_state.index_select(0, state_indices)
+            use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
+            state_starts = lengths.to(device=x_p.device, dtype=torch.int64).view(
+                num_prefills, 1, 1
+            )
+            state_offsets = torch.arange(
+                state_len, device=x_p.device, dtype=torch.int64
+            ).view(1, 1, state_len)
+            next_state = x_p.new_empty((num_prefills, hidden_size, state_len))
+        invalid_rows = ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1)
+        weights = conv_weights.unsqueeze(1).contiguous()
+        for c0 in range(0, hidden_size, chunk):
+            c1 = min(hidden_size, c0 + chunk)
+            width = c1 - c0
+            history = x_p.new_zeros((num_prefills, width, state_len + max_len))
+            history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p[
+                :, c0:c1
+            ]
+            if have_state:
+                state = existing_state[:, c0:c1, :state_len].to(x_p.dtype)
+                history[..., :state_len] = torch.where(
+                    use_initial_mask, state, torch.zeros_like(state)
+                )
+                next_state[:, c0:c1] = history.gather(
+                    dim=2,
+                    index=(state_starts + state_offsets).expand(-1, width, -1),
+                )
+            conv_output = F.conv1d(
+                history,
+                weights[c0:c1],
+                groups=width,
+                dilation=self.short_conv_dilation,
+            )
+            del history
+            F.silu(conv_output, inplace=True)
+            conv_output.masked_fill_(invalid_rows, 0)
+            output[:, c0:c1] = conv_output.transpose(1, 2)[req_indices, col_indices]
+            del conv_output
+        if have_state:
+            existing_base_state = existing_state[..., :state_len]
+            update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+            safe_next_state = torch.where(
+                update_mask.view(num_prefills, 1, 1),
+                next_state.to(conv_state.dtype),
+                existing_base_state,
+            )
+            existing_state[..., :state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
         return output
 
@@ -2573,7 +2688,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                         num_prefill_tokens=num_prefill_tokens,
                     )
                 )
-                conv_out_non_spec = torch.vstack(non_spec_parts)
+                # A single part is already the result; vstack would copy it.
+                conv_out_non_spec = (
+                    non_spec_parts[0]
+                    if len(non_spec_parts) == 1
+                    else torch.vstack(non_spec_parts)
+                )
             else:
                 conv_out_non_spec = self._short_conv_dilated_decode_batched(
                     x_d=x_non_spec,
