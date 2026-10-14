@@ -1752,6 +1752,9 @@ def qsa_select_paged_tokens(
     # Keep small work, mixed requests, other topologies and graph capture on
     # the existing selector. Cache writes have already completed on every rank.
     tp_step = 0
+    # Rows the scorer sees; the expansion always uses the full batch.
+    score_token_to_req = token_to_req
+    score_positions = query_positions
     if (
         tp_group is not None
         and tp_group.world_size == 4
@@ -1759,23 +1762,30 @@ def qsa_select_paged_tokens(
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
-        and contiguous_keys is not None
         and not torch.cuda.is_current_stream_capturing()
     ):
         step = triton.cdiv(rows, tp_group.world_size)
         smallest_partition = rows - (tp_group.world_size - 1) * step
-        if smallest_partition >= sparse_policy().value(
-            "qsa_cublas_min_rows"
-        ) and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns):
+        # The single-request cuBLAS scorer keeps upstream's work gate. The
+        # paged scorer (several requests in the step, e.g. a prefill chunk
+        # next to decodes) is row-independent as well and partitions as is.
+        if contiguous_keys is None or (
+            smallest_partition >= sparse_policy().value("qsa_cublas_min_rows")
+            and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+        ):
             tp_step = step
             first = tp_group.rank_in_group * step
             last = min(first + step, rows)
             q = q[first:last]
-            assert all_visible is not None
-            all_visible = all_visible[first:last]
+            if all_visible is not None:
+                all_visible = all_visible[first:last]
+            score_token_to_req = token_to_req[first:last]
+            score_positions = query_positions[first:last]
             rows = last - first
             logger.info_once(
-                "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
+                "Using SM70 QSA TP4 prefill row partition with block-index "
+                "AllGather (%s scorer).",
+                "cuBLAS" if contiguous_keys is not None else "paged",
             )
     # Bound the per-chunk logits by the configured score tile on both the
     # cuBLAS and paged paths. Startup profiling skips attention, so this
@@ -1812,8 +1822,8 @@ def qsa_select_paged_tokens(
                 q[row_slice],
                 k_cache,
                 page_table,
-                token_to_req[row_slice],
-                query_positions[row_slice],
+                score_token_to_req[row_slice],
+                score_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
                 num_columns=score_columns,
