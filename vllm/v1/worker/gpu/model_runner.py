@@ -171,6 +171,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
+        # VLLM_SM70_PREFILL_MEM_TRACE: (tokens, requests, longest sequence,
+        # allocated before the forward, forward peak) of the last large step.
+        self._sm70_prefill_mem_pending: tuple[int, int, int, int, int] | None = None
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
@@ -1474,6 +1477,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return None
         return uniform_count
 
+    def _sm70_log_prefill_mem(self) -> None:
+        """VLLM_SM70_PREFILL_MEM_TRACE: the previous large step's peak.
+
+        Startup profiling skips attention-side work (QSA, GDN, PLE), so their
+        temporaries in large prefill steps are only seen here.
+        """
+        assert self._sm70_prefill_mem_pending is not None
+        tokens, reqs, longest, base, forward_peak = self._sm70_prefill_mem_pending
+        self._sm70_prefill_mem_pending = None
+        free, _ = torch.accelerator.get_memory_info()
+        mib = 1024 * 1024
+        logger.info(
+            "SM70 prefill memory: %d tokens (%d requests, longest seq %d): peak "
+            "+%.0f MiB over %.0f MiB allocated (forward +%.0f MiB); reserved "
+            "%.0f MiB, device free %.0f MiB",
+            tokens,
+            reqs,
+            longest,
+            (torch.accelerator.max_memory_allocated() - base) / mib,
+            base / mib,
+            forward_peak / mib,
+            torch.accelerator.memory_reserved() / mib,
+            free / mib,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1483,6 +1511,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self._sm70_prefill_mem_pending is not None:
+            self._sm70_log_prefill_mem()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1710,6 +1740,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
             )
 
+            mem_trace = envs.VLLM_SM70_PREFILL_MEM_TRACE
+            mem_trace = (
+                mem_trace > 0
+                and scheduler_output.total_num_scheduled_tokens >= mem_trace
+            )
+            if mem_trace:
+                torch.accelerator.reset_peak_memory_stats()
+                mem_base = torch.accelerator.memory_allocated()
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1722,6 +1760,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
+            if mem_trace:
+                # Logged at the start of the next step, so the peak also
+                # covers sampling and the MTP draft pass over the same rows.
+                self._sm70_prefill_mem_pending = (
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                    int(input_batch.seq_lens_cpu_upper_bound.max())
+                    if input_batch.seq_lens_cpu_upper_bound is not None
+                    else -1,
+                    mem_base,
+                    torch.accelerator.max_memory_allocated() - mem_base,
+                )
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()

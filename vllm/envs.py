@@ -380,6 +380,7 @@ if TYPE_CHECKING:
     VLLM_SM70_PREFILL_CONTENTION_TOKENS: int = 0
     VLLM_SM70_PLE_PREFILL_CONV: bool = False
     VLLM_SM70_QSA_PREFILL_TP_ROWS: bool = False
+    VLLM_SM70_PREFILL_MEM_TRACE: int = 0
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
@@ -2916,6 +2917,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunk across the four TP ranks and all-gather the selected block ids.
     "VLLM_SM70_QSA_PREFILL_TP_ROWS": lambda: bool(
         int(os.getenv("VLLM_SM70_QSA_PREFILL_TP_ROWS", "0"))
+    ),
+    # Log the forward's peak allocation for eager steps of at least this many
+    # scheduled tokens (diagnostic; 0 = off). Adds one device sync per step.
+    "VLLM_SM70_PREFILL_MEM_TRACE": lambda: int(
+        os.getenv("VLLM_SM70_PREFILL_MEM_TRACE", "0")
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
