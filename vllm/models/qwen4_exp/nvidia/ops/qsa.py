@@ -1418,8 +1418,15 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    tp_group=None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``tp_group`` (TP4, set by the indexer under VLLM_SM70_QSA_PREFILL_TP_ROWS)
+    lets one large single-request prefill chunk score a quarter of its rows
+    per rank; the ranks then all-gather the selected block ids. Queries and
+    the index cache are replicated, so every rank takes the same branch.
+    """
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -1467,10 +1474,36 @@ def qsa_select_paged_tokens(
         else:
             score_columns = capacity_columns
             all_visible = None
+    tp_step = 0
+    if (
+        tp_group is not None
+        and tp_group.world_size == 4
+        and 4096 <= rows <= 9216
+        and q.shape[1:] == (4, 128)
+        and token_topk == 2048
+        and compress_ratio == 4
+        and contiguous_keys is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        step = triton.cdiv(rows, tp_group.world_size)
+        smallest_partition = rows - (tp_group.world_size - 1) * step
+        if smallest_partition >= _SM70_INDEXER_CUBLAS_MIN_ROWS and (
+            _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+        ):
+            tp_step = step
+            first = tp_group.rank_in_group * step
+            last = min(first + step, rows)
+            q = q[first:last]
+            assert all_visible is not None
+            all_visible = all_visible[first:last]
+            rows = last - first
+            logger.info_once(
+                "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
+            )
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
-        (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+        (tp_step or chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
     topk_workspace = torch.empty(
         (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
@@ -1496,7 +1529,11 @@ def qsa_select_paged_tokens(
                 sequence_lengths,
                 compress_ratio,
             )
-        blocks = blocks_buffer[: row_end - row_start]
+        blocks = (
+            blocks_buffer[row_slice]
+            if tp_step
+            else blocks_buffer[: row_end - row_start]
+        )
         use_cooperative_topk = (
             blocks.shape[0] <= 32
             and logits.stride(0) % 4 == 0
@@ -1531,14 +1568,29 @@ def qsa_select_paged_tokens(
                 block_topk,
                 score_columns,
             )
+        if not tp_step:
+            expand_qsa_block_indices_cuda(
+                blocks,
+                query_positions[row_slice],
+                sequence_lengths,
+                token_to_req[row_slice],
+                compress_ratio,
+                token_topk,
+                out[row_slice],
+            )
+    if tp_step:
+        # Gather the compressed block ids, not the four times wider expanded
+        # token matrix. Padding is confined to the last rank and discarded.
+        blocks_buffer[rows:].fill_(-1)
+        gathered = tp_group.all_gather(blocks_buffer, dim=0)
         expand_qsa_block_indices_cuda(
-            blocks,
-            query_positions[row_slice],
+            gathered[: out.shape[0]],
+            query_positions,
             sequence_lengths,
-            token_to_req[row_slice],
+            token_to_req,
             compress_ratio,
             token_topk,
-            out[row_slice],
+            out,
         )
     return out
 

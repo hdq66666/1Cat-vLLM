@@ -9,6 +9,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -129,6 +130,17 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
         self.skip_topk = False
+        self.prefill_tp_group = None
+        parallel = vllm_config.parallel_config
+        if (
+            envs.VLLM_SM70_QSA_PREFILL_TP_ROWS
+            and parallel.tensor_parallel_size == 4
+            and getattr(parallel, "decode_context_parallel_size", 1) == 1
+            and getattr(parallel, "prefill_context_parallel_size", 1) == 1
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            self.prefill_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -349,6 +361,7 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            tp_group=self.prefill_tp_group,
         )
 
 

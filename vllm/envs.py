@@ -378,6 +378,8 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
     VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES: bool = False
     VLLM_SM70_PREFILL_CONTENTION_TOKENS: int = 0
+    VLLM_SM70_PLE_PREFILL_CONV: bool = False
+    VLLM_SM70_QSA_PREFILL_TP_ROWS: bool = False
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
@@ -2903,6 +2905,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # budget; every decoding request then waits for that step. 0 = no cap.
     "VLLM_SM70_PREFILL_CONTENTION_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_PREFILL_CONTENTION_TOKENS", "0")
+    ),
+    # PLE prefill convolution that reads request rows and the old state in
+    # place (SM70 FP16, 10240 channels, 4 taps, dilation 3) instead of a padded
+    # history copy. Bit-exact; halves the temporaries of the PLE layer.
+    "VLLM_SM70_PLE_PREFILL_CONV": lambda: bool(
+        int(os.getenv("VLLM_SM70_PLE_PREFILL_CONV", "0"))
+    ),
+    # Split the replicated QSA indexer scoring of one 4096-9216-row prefill
+    # chunk across the four TP ranks and all-gather the selected block ids.
+    "VLLM_SM70_QSA_PREFILL_TP_ROWS": lambda: bool(
+        int(os.getenv("VLLM_SM70_QSA_PREFILL_TP_ROWS", "0"))
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.

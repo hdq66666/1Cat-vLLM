@@ -1855,6 +1855,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
         self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        self._prefill_short_conv = envs.VLLM_SM70_PLE_PREFILL_CONV
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
         # The offload subprocess constructs the surrounding model on meta, but
@@ -2175,6 +2176,58 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return output
 
         hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
+        if (
+            getattr(self, "_prefill_short_conv", False)
+            and current_platform.is_device_capability(70)
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and x_p.stride(1) == 1
+            and all(
+                t.is_cuda and t.dtype == torch.float16
+                for t in (x_p, conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p,
+                    has_initial_states_p,
+                )
+            )
+            and state_indices_tensor_p.is_contiguous()
+            and has_initial_states_p.is_contiguous()
+        ):
+            # Read request rows and the old state in place instead of building
+            # the padded channels-first history (about 2x the batch in
+            # temporaries, which startup profiling does not see).
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            logger.info_once(
+                "Using SM70 PLE prefill convolution without padded history."
+            )
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                0,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+                token_tile=16,
+            )
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
@@ -2732,8 +2785,7 @@ def qwen4_exp_ple_pinned_gather_raw(
     storage_dtype = _TRITON_STORAGE_DTYPES.get(output.dtype)
     if storage_dtype is None:
         raise NotImplementedError(
-            "Qwen4Exp pinned-host PLE raw gather does not support "
-            f"{output.dtype}"
+            f"Qwen4Exp pinned-host PLE raw gather does not support {output.dtype}"
         )
     # Same contract as qwen4_exp_ple_pinned_gather: the table pointer is
     # resolved here, inside the opaque op, never traced into a graph.
