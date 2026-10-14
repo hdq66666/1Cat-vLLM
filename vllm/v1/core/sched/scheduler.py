@@ -8,7 +8,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -335,18 +334,17 @@ class Scheduler(SchedulerInterface):
             and self.mamba_state_block_size is not None
             and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
-        self.prefill_contention_tokens = envs.VLLM_SM70_PREFILL_CONTENTION_TOKENS
         if self.need_mamba_block_aligned_split:
             logger.info(
                 "Mamba-aligned prefill split: %s (retention interval %s, state "
                 "block %s tokens, token budget %d, dense under contention %s, "
-                "prefill cap while decoding %s).",
+                "long prefill threshold %s).",
                 "dense" if self.mamba_state_retention_interval is None else "sparse",
                 self.mamba_state_retention_interval,
                 self.mamba_state_block_size,
                 self.max_num_scheduled_tokens,
                 self.mamba_dense_boundaries_on_contention,
-                self.prefill_contention_tokens or "off",
+                self.scheduler_config.long_prefill_token_threshold or "off",
             )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -539,30 +537,6 @@ class Scheduler(SchedulerInterface):
         )
         return max(end - start, 0)
 
-    def _contention_prefill_cap(
-        self, request: Request, num_computed_tokens: int, num_new_tokens: int
-    ) -> int:
-        """Cap a prefill chunk while another request is decoding.
-
-        A decoding request gets one token step per scheduler step, so a long
-        prefill step stalls its output for the whole step. With
-        VLLM_SM70_PREFILL_CONTENTION_TOKENS > 0 a prefill chunk is limited to
-        that many tokens whenever some other running request is past its
-        prompt. The Mamba split that follows still aligns the chunk end.
-        """
-        cap = getattr(self, "prefill_contention_tokens", 0)
-        if cap <= 0 or num_new_tokens <= cap:
-            return num_new_tokens
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        if num_computed_tokens >= prefill_end:
-            return num_new_tokens
-        for other in self.running:
-            if other is not request and (
-                other.num_computed_tokens >= other.num_prompt_tokens
-            ):
-                return cap
-        return num_new_tokens
-
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -679,9 +653,6 @@ class Scheduler(SchedulerInterface):
                     )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = self._contention_prefill_cap(
-                request, request.num_computed_tokens, num_new_tokens
-            )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -1004,9 +975,6 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
-                    num_new_tokens = self._contention_prefill_cap(
-                        request, num_computed_tokens, num_new_tokens
-                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
