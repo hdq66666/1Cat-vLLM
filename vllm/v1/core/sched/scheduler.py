@@ -340,7 +340,7 @@ class Scheduler(SchedulerInterface):
             logger.info(
                 "Mamba-aligned prefill split: %s (retention interval %s, state "
                 "block %s tokens, token budget %d, dense under contention %s, "
-                "prefill cap while decoding %s).",
+                "prefill cap under contention %s).",
                 "dense" if self.mamba_state_retention_interval is None else "sparse",
                 self.mamba_state_retention_interval,
                 self.mamba_state_block_size,
@@ -542,13 +542,16 @@ class Scheduler(SchedulerInterface):
     def _contention_prefill_cap(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """Cap a prefill chunk while another request is decoding.
+        """Cap a prefill chunk while other requests are running or waiting.
 
-        A decoding request gets one token step per scheduler step, so a long
-        prefill step stalls its output for the whole step. With
+        Sparse Mamba checkpoints let one prefill step take the whole token
+        budget. A decoding request then waits for that step for each of its
+        tokens, and a second prefill only gets what the first leaves of the
+        budget until the first one is done. With
         VLLM_SM70_PREFILL_CONTENTION_TOKENS > 0 a prefill chunk is limited to
-        that many tokens whenever some other running request is past its
-        prompt. The Mamba split that follows still aligns the chunk end.
+        that many tokens whenever any other request is running or waiting
+        (the request itself is in one of the two queues while it is being
+        scheduled). The Mamba split that follows still aligns the chunk end.
         """
         cap = getattr(self, "prefill_contention_tokens", 0)
         if cap <= 0 or num_new_tokens <= cap:
@@ -556,11 +559,8 @@ class Scheduler(SchedulerInterface):
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if num_computed_tokens >= prefill_end:
             return num_new_tokens
-        for other in self.running:
-            if other is not request and (
-                other.num_computed_tokens >= other.num_prompt_tokens
-            ):
-                return cap
+        if len(self.running) + len(self.waiting) > 1:
+            return cap
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:

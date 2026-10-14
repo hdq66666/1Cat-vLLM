@@ -2901,9 +2901,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "0"))
     ),
-    # Largest prefill chunk, in tokens, while another request is decoding.
-    # Sparse Mamba checkpoints let one prefill step take the whole token
-    # budget; every decoding request then waits for that step. 0 = no cap.
+    # Largest prefill chunk, in tokens, while other requests are running or
+    # waiting. Sparse Mamba checkpoints let one prefill step take the whole
+    # token budget; decoding requests then wait for that step and a second
+    # prefill gets only the rest of the budget. 0 = no cap.
     "VLLM_SM70_PREFILL_CONTENTION_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_PREFILL_CONTENTION_TOKENS", "0")
     ),
