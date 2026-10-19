@@ -54,14 +54,14 @@ _SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
 # independently auditable.
 _ROLE_PLANS: tuple[tuple[str, tuple[int, int], _GemvPlan], ...] = (
     # max_m measured on 4xV100 (micro_m2d.py), tiled-vs-cuBLAS ratio in comment
-    (_HC_DOWN_SUFFIX, (336, 10240), _GemvPlan(512, 4, 1, 2)),   # M3 0.95x
+    (_HC_DOWN_SUFFIX, (336, 10240), _GemvPlan(512, 4, 1, 2)),  # M3 0.95x
     (_GDN_QKVZ_SUFFIX, (4096, 2560), _GemvPlan(512, 2, 0, 4)),  # M4 1.12x
-    (_GDN_BA_SUFFIX, (24, 2560), _GemvPlan(512, 4, 0, 16)),     # M16 1.63x
-    (_GDN_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 1, 8)),   # M8 1.14x
-    (_QSA_QKV_SUFFIX, (3584, 2560), _GemvPlan(512, 2, 0, 8)),   # M8 1.09x
-    (_QSA_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 0, 8)),   # M8 1.08x
-    (_QSA_INDEX_SUFFIX, (640, 2560), _GemvPlan(512, 2, 0, 16)), # M16 1.14x
-    (_ROUTER_SUFFIX, (512, 2560), _GemvPlan(1024, 8, 0, 16)),   # M16 1.36x
+    (_GDN_BA_SUFFIX, (24, 2560), _GemvPlan(512, 4, 0, 16)),  # M16 1.63x
+    (_GDN_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 1, 8)),  # M8 1.14x
+    (_QSA_QKV_SUFFIX, (3584, 2560), _GemvPlan(512, 2, 0, 8)),  # M8 1.09x
+    (_QSA_OUT_SUFFIX, (2560, 1536), _GemvPlan(512, 4, 0, 8)),  # M8 1.08x
+    (_QSA_INDEX_SUFFIX, (640, 2560), _GemvPlan(512, 2, 0, 16)),  # M16 1.14x
+    (_ROUTER_SUFFIX, (512, 2560), _GemvPlan(1024, 8, 0, 16)),  # M16 1.36x
 )
 
 # The fused GDN input op drives (4096, 2560) and (24, 2560) together, so it
@@ -643,9 +643,7 @@ def _qwen38_sm70_fp16_gdn_input(
             BLOCK_K=512,
             num_warps=2,
         )
-        logger.info_once(
-            "SM70 Qwen3.8 checkpoint-FP16 fused GDN input route enabled."
-        )
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 fused GDN input route enabled.")
         return qkv, z, b, a
 
     _qwen38_fp16_gdn_input_m_kernel[(4096 + 24,)](

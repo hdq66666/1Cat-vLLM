@@ -253,7 +253,6 @@ def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
     layer.sm70_fp8_fp16_dequant = True
 
 
-
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
     def __init__(
         self,

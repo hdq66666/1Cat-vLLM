@@ -4,13 +4,13 @@
 options.allow_request_directives): strictly validated, experiments only."""
 
 import pytest
-from vllm.v1.simple_kv_offload.options import parse_options
 
 from vllm.v1.simple_kv_offload.manager import (
     CONTROLS,
     Directives,
     parse_directives,
 )
+from vllm.v1.simple_kv_offload.options import parse_options
 
 pytestmark = pytest.mark.cpu_test
 

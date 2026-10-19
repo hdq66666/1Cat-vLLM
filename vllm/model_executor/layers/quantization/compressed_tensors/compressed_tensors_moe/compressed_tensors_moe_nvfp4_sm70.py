@@ -50,8 +50,9 @@ class CompressedTensorsNvFp4SM70MoEMethod(ModelOptNvFp4SM70MoEMethod):
         **extra_weight_attrs,
     ) -> None:
         # Register under the compressed-tensors names so the checkpoint loads.
+        # The borrowed method only reads attributes set in __init__ above.
         CompressedTensorsW4A4Nvfp4MoEMethod.create_weights(
-            self,
+            self,  # type: ignore[arg-type]
             layer,
             num_experts,
             hidden_size,
@@ -97,9 +98,7 @@ class CompressedTensorsNvFp4SM70MoEMethod(ModelOptNvFp4SM70MoEMethod):
                 if hasattr(layer, src)
                 else torch.empty(0, dtype=torch.float32)
             )
-            setattr(
-                layer, dst, torch.nn.Parameter(data, requires_grad=False)
-            )
+            setattr(layer, dst, torch.nn.Parameter(data, requires_grad=False))
         super().process_weights_after_loading(layer)
         # Drop the compressed-tensors originals the SM70 repack no longer needs.
         for leftover in (

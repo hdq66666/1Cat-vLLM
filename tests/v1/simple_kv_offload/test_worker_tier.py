@@ -15,7 +15,6 @@ from unittest import mock
 import msgspec
 import pytest
 import torch
-from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -26,6 +25,7 @@ from vllm.v1.simple_kv_offload import worker as worker_mod
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
 from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 from vllm.v1.simple_kv_offload.stats import (
     LOAD_BLOCKS,
     LOAD_BYTES,

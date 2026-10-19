@@ -146,9 +146,7 @@ def _split_sm70_mtp_manager_capture_sizes(
         # five rows, the shape the drafter's MoE is tuned for. Keep the
         # one-row graph and let 2..4 use the five-row one again.
         request_sizes = [
-            size
-            for size in request_sizes
-            if size == 1 or size >= verifier_query_len
+            size for size in request_sizes if size == 1 or size >= verifier_query_len
         ]
     return request_sizes
 
