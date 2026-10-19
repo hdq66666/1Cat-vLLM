@@ -5885,8 +5885,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # Reuse the decode loader with the original fused verifier's
                 # gating, BV32 reduction and FP32 state. Avoid materializing
                 # three contiguous splits and concatenating them again.
+                # Every row of the step is a speculative row (upstream names
+                # this spec_rows_are_batch); this route already requires it.
                 direct_verify_out = bool(
-                    spec_rows_are_batch
+                    attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
                     and num_actual_tokens in (5, 20)
                     and core_attn_out.is_contiguous()
