@@ -380,6 +380,7 @@ if TYPE_CHECKING:
     VLLM_SM70_PLE_PREFILL_CONV: bool = False
     VLLM_SM70_QSA_PREFILL_TP_ROWS: bool = False
     VLLM_SM70_PREFILL_MEM_TRACE: int = 0
+    VLLM_SM70_PLE_INPUT_PREPARE: bool = True
     VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
     VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
@@ -2917,6 +2918,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scheduled tokens (diagnostic; 0 = off). Adds one device sync per step.
     "VLLM_SM70_PREFILL_MEM_TRACE": lambda: int(
         os.getenv("VLLM_SM70_PREFILL_MEM_TRACE", "0")
+    ),
+    # Build the PLE n-gram context and query boundaries of up to four SM70
+    # requests in one Triton launch instead of a dozen small torch ops.
+    "VLLM_SM70_PLE_INPUT_PREPARE": lambda: bool(
+        int(os.getenv("VLLM_SM70_PLE_INPUT_PREPARE", "1"))
     ),
     # MRv2 prompt logprobs rows per logits chunk. 32 bounds the temporary
     # full-vocabulary logits; raise only after memory acceptance. Use the same
