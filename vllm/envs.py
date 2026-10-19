@@ -381,6 +381,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_PREFILL_TP_ROWS: bool = False
     VLLM_SM70_PREFILL_MEM_TRACE: int = 0
     VLLM_SM70_PLE_INPUT_PREPARE: bool = True
+    VLLM_SM70_GDN_VERIFY_ROUTE_DEBUG: bool = False
     VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 32
     VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES: int = 64 * 1024 * 1024
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
@@ -2923,6 +2924,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # requests in one Triton launch instead of a dozen small torch ops.
     "VLLM_SM70_PLE_INPUT_PREPARE": lambda: bool(
         int(os.getenv("VLLM_SM70_PLE_INPUT_PREPARE", "1"))
+    ),
+    # Diagnostic: log the admission conditions of the first few speculative
+    # GDN steps that skip the SM70 mixed-QKV verifier.
+    "VLLM_SM70_GDN_VERIFY_ROUTE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_VERIFY_ROUTE_DEBUG", "0"))
     ),
     # MRv2 prompt logprobs rows per logits chunk. 32 bounds the temporary
     # full-vocabulary logits; raise only after memory acceptance. Use the same

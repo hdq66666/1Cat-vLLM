@@ -368,6 +368,66 @@ def _ddtree_depth_batches(
     return prefix_rows, batches_by_depth
 
 
+_SM70_MIXED_QKV_VERIFY_GATE_LOGS = 0
+
+
+def _sm70_log_mixed_qkv_verify_gates(
+    layer,
+    attn_metadata,
+    mixed_qkv: torch.Tensor,
+    mixed_qkv_spec: torch.Tensor | None,
+    spec_sequence_masks: torch.Tensor | None,
+    ddtree_parent_ids: torch.Tensor | None,
+    ssm_state: torch.Tensor,
+    mixed_qkv_decode_requested: bool,
+    use_dflash2_packed_gdn_verify: bool,
+) -> None:
+    """Log why a speculative step skipped the SM70 mixed-QKV verifier.
+
+    Diagnostic only (VLLM_SM70_GDN_VERIFY_ROUTE_DEBUG); logs the first few
+    skipped steps with the value of every admission condition.
+    """
+    global _SM70_MIXED_QKV_VERIFY_GATE_LOGS
+    if _SM70_MIXED_QKV_VERIFY_GATE_LOGS >= 8 or torch.compiler.is_compiling():
+        return
+    _SM70_MIXED_QKV_VERIFY_GATE_LOGS += 1
+
+    def layout(t: torch.Tensor | None) -> str:
+        if t is None:
+            return "None"
+        return (
+            f"{tuple(t.shape)}/stride{tuple(t.stride())}/"
+            f"{'contig' if t.is_contiguous() else 'strided'}/{t.dtype}"
+        )
+
+    gates = {
+        "flag": layer.enable_sm70_fused_sigmoid_mixed_qkv,
+        "decode_requested": mixed_qkv_decode_requested,
+        "dflash2_packed": use_dflash2_packed_gdn_verify,
+        "spec_masks_none": spec_sequence_masks is None,
+        "meta_spec_masks_none": attn_metadata.spec_sequence_masks is None,
+        "ddtree_none": ddtree_parent_ids is None,
+        "prefills": attn_metadata.num_prefills,
+        "decodes": attn_metadata.num_decodes,
+        "spec_decodes": attn_metadata.num_spec_decodes,
+        "actual_tokens": attn_metadata.num_actual_tokens,
+        "sm70": current_platform.is_device_capability(70),
+        "k_heads": layer.num_k_heads // layer.tp_size,
+        "v_heads": layer.num_v_heads // layer.tp_size,
+        "head_dims": (layer.head_k_dim, layer.head_v_dim),
+        "ssm_dtype": str(ssm_state.dtype),
+        "mixed_qkv": layout(mixed_qkv),
+        "mixed_qkv_spec": layout(mixed_qkv_spec),
+        "capturing": torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing(),
+    }
+    logger.info(
+        "SM70 mixed-QKV verifier skipped (%s): %s",
+        layer.prefix,
+        ", ".join(f"{k}={v}" for k, v in gates.items()),
+    )
+
+
 def _log_runtime_route_once(message: str, *args) -> None:
     if torch.compiler.is_compiling():
         return
@@ -5709,6 +5769,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
         )
+        if (
+            envs.VLLM_SM70_GDN_VERIFY_ROUTE_DEBUG
+            and not use_sm70_mixed_qkv_verify
+            and attn_metadata.num_spec_decodes > 0
+        ):
+            _sm70_log_mixed_qkv_verify_gates(
+                self,
+                attn_metadata,
+                mixed_qkv,
+                mixed_qkv_spec,
+                spec_sequence_masks,
+                ddtree_parent_ids,
+                ssm_state,
+                mixed_qkv_decode_requested,
+                use_dflash2_packed_gdn_verify,
+            )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
