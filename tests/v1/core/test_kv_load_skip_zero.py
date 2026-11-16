@@ -149,7 +149,10 @@ def _make_scheduler(extra: dict | None = None) -> Scheduler:
 
 
 def _make_request(
-    request_id: str, prompt_token_ids: list[int], directives: dict | None = None
+    request_id: str,
+    prompt_token_ids: list[int],
+    directives: dict | None = None,
+    max_tokens: int = 1,
 ) -> Request:
     extra_args = (
         {"kv_transfer_params": {"simple_cpu": directives}} if directives else None
@@ -157,7 +160,7 @@ def _make_request(
     return Request(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
-        sampling_params=SamplingParams(max_tokens=1, extra_args=extra_args),
+        sampling_params=SamplingParams(max_tokens=max_tokens, extra_args=extra_args),
         pooling_params=None,
         mm_features=None,
         block_hasher=get_request_block_hasher(RING_BLOCK, sha256),
@@ -452,7 +455,9 @@ def test_invalid_blocks_truncate_to_the_shortest_valid_prefix_across_groups() ->
     block's start, and every group's downstream blocks are evicted."""
     scheduler = _make_scheduler()
     prompt = list(range(2000, 2000 + PROMPT_LEN))
-    scheduler.add_request(_make_request("D", prompt))
+    # Upstream prefills this prompt in one step (dense Mamba boundaries), so
+    # keep the request alive past its prefill to inspect its blocks.
+    scheduler.add_request(_make_request("D", prompt, max_tokens=16))
     for _ in range(2):
         _step(scheduler)
     request = scheduler.requests["D"]
@@ -477,8 +482,13 @@ def test_invalid_blocks_truncate_to_the_shortest_valid_prefix_across_groups() ->
     affected, tokens, evict = scheduler._update_requests_with_invalid_blocks(
         [request], invalid, {}, evict_blocks=True
     )
-    assert affected == {"D"} and request.num_computed_tokens == start
-    assert tokens == computed - start
+    # A state group resumes from the last real state block before the failed
+    # one; without one (sparse retention kept no earlier state) the request
+    # recomputes from the start.
+    prior = [j for j in range(idx_m) if mamba_blocks[j] != 0]
+    cut = (prior[-1] + 1) * MAMBA_BLOCK if prior else 0
+    assert affected == {"D"} and request.num_computed_tokens == cut
+    assert tokens == computed - cut
     assert set(fa_blocks[idx_f:]) <= evict and set(mamba_blocks[idx_m:]) <= evict
     assert fa_blocks[idx_f - 1] not in evict
 
@@ -504,11 +514,11 @@ def test_request_directives_reach_the_worker_metadata() -> None:
     # metadata and in no later one.
     scheduler.add_request(
         _make_request(
-            "K", list(range(3000, 3040)), {"control": {"qsa_grouped_page4": "0"}}
+            "K", list(range(3000, 3040)), {"control": {"copy_backend": "memcpy"}}
         )
     )
     _, meta = _step(scheduler)
-    assert meta.controls == {"qsa_grouped_page4": "0"} and meta.load_event < 0
+    assert meta.controls == {"copy_backend": "memcpy"} and meta.load_event < 0
     _, meta = _step(scheduler)
     assert meta.controls == {}
     for _ in range(8):

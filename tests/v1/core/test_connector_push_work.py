@@ -131,6 +131,10 @@ def _make_engine(
     if batch_queue_size > 1:
         engine.batch_queue = deque(maxlen=batch_queue_size)
     engine._sm70_async_cpu_trace_step = 0
+    # EngineCore.__init__ defaults with VLLM_V41_PP_MICRO/AHEAD unset.
+    engine._v41_micro = False
+    engine._v41_depth = batch_queue_size
+    engine._v41_skip = 0
     engine.step_fn = (
         engine.step if engine.batch_queue is None else engine.step_with_batch_queue
     )
