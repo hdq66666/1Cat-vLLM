@@ -134,6 +134,25 @@ def _apply_sm70_qwen38_disk_ple_defaults(
     return host_gib
 
 
+def _qwen4exp_ple_storage_rejection(cfg: VllmConfig) -> str | None:
+    """Why this checkpoint's PLE tables cannot take the disk/hybrid PLE lane.
+
+    The disk-mmap and hybrid lanes serve raw E4M3 or packed GGUF rows. A
+    checkpoint with unquantized (BF16/FP16) PLE tables keeps them on the
+    device and pinned-host tiers instead. Models without PLE layers return
+    None, leaving their defaults unchanged. Only the storage format decides;
+    partition constraints keep their own checks.
+    """
+    text = getattr(cfg.model_config, "hf_text_config", None)
+    if not getattr(text, "ple_layer_ids", None):
+        return None
+    from vllm.model_executor.models.runtime_defaults import (
+        ple_storage_format_rejection,
+    )
+
+    return ple_storage_format_rejection(cfg)
+
+
 def _ple_disk_cascade_cuda_supported() -> bool:
     from vllm.platforms import current_platform
 
@@ -451,11 +470,21 @@ def apply_runtime_policy_defaults(self):
             )
             and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in defaults
         ):
-            defaults["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
-            logger.info_once(
-                "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
-                "large prefill and FULL decode graphs share one model."
-            )
+            ple_rejection = _qwen4exp_ple_storage_rejection(self)
+            if ple_rejection is not None:
+                # The lane is qualified with disk/hybrid PLE only; keep the
+                # single-compile model and its resident PLE tiers.
+                logger.info_once(
+                    "Not auto-enabling the SM70 Qwen3.8 dual-compile lane: %s. "
+                    "Set VLLM_SM70_QWEN38_DUAL_COMPILE=1 to override.",
+                    ple_rejection,
+                )
+            else:
+                defaults["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                logger.info_once(
+                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                    "large prefill and FULL decode graphs share one model."
+                )
         if (
             _is_sm70_qwen38_decode_compile_contract(
                 self.model_config,
@@ -478,22 +507,34 @@ def apply_runtime_policy_defaults(self):
                 )
             )
         ):
-            # Host KV already holds history in pinned memory, and the device
-            # shards of a hybrid PLE table leave its state pool too little VRAM.
-            host_kv = self.kernel_config.qsa_host_kv
-            host_gib = _apply_sm70_qwen38_disk_ple_defaults(
-                self.parallel_config,
-                defaults=defaults,
-                model=None if host_kv else self.model_config.model,
-            )
-            logger.info_once(
-                "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile lane: %s.",
-                "disk-mmap" if host_gib is None else "hybrid",
-                "bounded result staging, no resident table"
-                if host_gib is None
-                else f"decode gathers {host_gib} GiB pinned-host/device shards "
-                "per rank, prefill reads the disk-backed table",
-            )
+            ple_rejection = _qwen4exp_ple_storage_rejection(self)
+            if ple_rejection is not None:
+                # Unquantized PLE tables have no disk/hybrid reader; keep them
+                # on the device and pinned-host tiers.
+                logger.info_once(
+                    "Keeping resident PLE tiers with the SM70 Qwen3.8 "
+                    "dual-compile lane: %s.",
+                    ple_rejection,
+                )
+            else:
+                # Host KV already holds history in pinned memory, and the
+                # device shards of a hybrid PLE table leave its state pool too
+                # little VRAM.
+                host_kv = self.kernel_config.qsa_host_kv
+                host_gib = _apply_sm70_qwen38_disk_ple_defaults(
+                    self.parallel_config,
+                    defaults=defaults,
+                    model=None if host_kv else self.model_config.model,
+                )
+                logger.info_once(
+                    "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile "
+                    "lane: %s.",
+                    "disk-mmap" if host_gib is None else "hybrid",
+                    "bounded result staging, no resident table"
+                    if host_gib is None
+                    else f"decode gathers {host_gib} GiB pinned-host/device "
+                    "shards per rank, prefill reads the disk-backed table",
+                )
     qualification = self.apply_model_runtime_defaults(
         defaults, "verifier", is_sm70=is_sm70
     )

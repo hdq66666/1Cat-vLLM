@@ -430,13 +430,9 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
 def ple_storage_rejection(cfg) -> str | None:
     """Model partition and checkpoint layout contract for resident PLE tiers."""
     text = cfg.model_config.hf_text_config
-    layers = text.ple_layer_ids
     reason = None
     from vllm.models.qwen4_exp.common.ple import (
         check_ple_layers_on_first_pp_rank,
-    )
-    from vllm.models.qwen4_exp.nvidia.ple_layer import (
-        _get_ple_embedding_quant_method,
     )
 
     try:
@@ -446,26 +442,41 @@ def ple_storage_rejection(cfg) -> str | None:
     except (ValueError, RuntimeError) as exc:
         reason = str(exc)
     if reason is None:
-        storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix("torch.")
-        # The model's hf_to_vllm_mapper is applied to the quantization
-        # config only when the model is built, so its layer metadata still
-        # uses checkpoint names here. ple_layer_ids are 1-based: id L is
-        # the PLE module of decoder layer L - 1.
-        methods = [
-            _get_ple_embedding_quant_method(
-                cfg.quant_config,
-                f"model.language_model.layers.{int(layer_id) - 1}"
-                ".ple.ple_embedding.ngram_embedding",
-                force_fp8_storage=storage == "float8_e4m3fn",
-            )
-            for layer_id in layers
-        ]
-        if any(method is None for method in methods):
-            reason = (
-                "checkpoint metadata does not provide raw E4M3 or packed GGUF "
-                "PLE storage"
-            )
+        reason = ple_storage_format_rejection(cfg)
     return reason
+
+
+def ple_storage_format_rejection(cfg) -> str | None:
+    """Whether the checkpoint's PLE tables are raw E4M3 or packed GGUF.
+
+    The disk-mmap, hybrid and cascade PLE lanes read only those formats; an
+    unquantized (BF16/FP16) table is served from the resident tiers instead.
+    """
+    from vllm.models.qwen4_exp.nvidia.ple_layer import (
+        _get_ple_embedding_quant_method,
+    )
+
+    text = cfg.model_config.hf_text_config
+    storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix("torch.")
+    # The model's hf_to_vllm_mapper is applied to the quantization config
+    # only when the model is built, so its layer metadata still uses
+    # checkpoint names here. ple_layer_ids are 1-based: id L is the PLE module
+    # of decoder layer L - 1.
+    methods = [
+        _get_ple_embedding_quant_method(
+            cfg.quant_config,
+            f"model.language_model.layers.{int(layer_id) - 1}"
+            ".ple.ple_embedding.ngram_embedding",
+            force_fp8_storage=storage == "float8_e4m3fn",
+        )
+        for layer_id in text.ple_layer_ids
+    ]
+    if any(method is None for method in methods):
+        return (
+            "checkpoint metadata does not provide raw E4M3 or packed GGUF PLE "
+            "storage"
+        )
+    return None
 
 
 def sparse_execution_family(model_config):

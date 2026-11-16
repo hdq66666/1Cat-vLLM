@@ -254,6 +254,30 @@ def _gather_ple_fp8_from_pinned_kernel(
 
 
 @triton.jit
+def _gather_ple_raw_from_pinned_kernel(
+    weight_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STORAGE_DTYPE: tl.constexpr,
+):
+    """Gather one unquantized PLE row per program from pinned host memory."""
+
+    row_idx = tl.program_id(0)
+    local_idx = tl.load(ids_ptr + row_idx)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    typed_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(STORAGE_DTYPE))
+    values = tl.load(
+        typed_ptr + local_idx * embedding_dim + offsets,
+        mask=mask,
+        other=0,
+    )
+    tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
+
+
+@triton.jit
 def _dequantize_ple_fp8_bytes_kernel(
     input_ptr,
     scale_ptr,
@@ -545,6 +569,73 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
             prepare_accelerator_weight()
 
 
+class Qwen4ExpPLERawEmbeddingMethod(QuantizeMethodBase):
+    """Unquantized PLE embedding held at the model dtype.
+
+    For checkpoints that ship the n-gram table in BF16/FP16 instead of FP8.
+    Storage doubles to 2 bytes per element; the pinned-host UVA gather path is
+    otherwise identical to the FP8 one, so decode keeps reading rows straight
+    out of host memory instead of routing through the CPU-offload process.
+    """
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+        )
+        layer.register_parameter("weight", weight)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("PLE raw weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        pinned_lookup = getattr(layer, "embedding_lookup", None)
+        if pinned_lookup is not None:
+            return pinned_lookup(input_)
+        get_accelerator_weight = getattr(layer, "get_accelerator_weight", None)
+        weight = (
+            get_accelerator_weight(input_.device)
+            if get_accelerator_weight is not None
+            else layer.weight
+        )
+        return F.embedding(input_, weight)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        prepare_accelerator_weight = getattr(layer, "prepare_accelerator_weight", None)
+        if prepare_accelerator_weight is not None:
+            prepare_accelerator_weight()
+
+
+# Unquantized pinned-host PLE storage dtypes and their Triton element types.
+_TRITON_STORAGE_DTYPES = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+_RAW_PLE_STORAGE_NAMES = ("", "bfloat16", "float16", "float32")
+
+
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
@@ -664,7 +755,14 @@ def _pin_host_tensor_exact(tensor: torch.Tensor) -> None:
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """TP-sharded FP8 PLE table split between device memory and pinned host.
+    """TP-sharded PLE table split between device memory and pinned host.
+
+    Storage is FP8 with a global scale, or the checkpoint's unquantized
+    BF16/FP16 dtype; placement, loading and the UVA gather are shared and only
+    the gather kernel differs. The disk tier and the PLE offload worker's
+    remote rows carry FP8 bytes only, so unquantized storage is limited to the
+    device and pinned-host tiers and is rejected before any table is built
+    when a disk tier is requested.
 
     The base embedding is constructed on the meta device, so nothing is
     allocated up front. The real tables are built lazily on the first
@@ -691,10 +789,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     ) -> None:
         if not is_pin_memory_available():
             raise RuntimeError("Qwen4Exp PLE host offload requires pinned host memory")
-        if not isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
+        if not isinstance(
+            quant_method,
+            (Qwen4ExpPLEFp8EmbeddingMethod, Qwen4ExpPLERawEmbeddingMethod),
+        ):
             raise NotImplementedError(
-                "Qwen4Exp pinned-host PLE currently requires FP8 checkpoint storage"
+                "Qwen4Exp pinned-host PLE requires FP8 or unquantized storage"
             )
+        self._is_fp8_storage = isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
 
         with torch.device("meta"):
             super().__init__(
@@ -737,17 +839,30 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         placeholder._vllm_keep_on_cpu = True
         self.weight = placeholder
-        self.weight_scale = create_fp8_scale_parameter(
-            PerTensorScaleParameter,
-            [self.num_embeddings_per_partition],
-            self.embedding_dim,
-            None,
-            self.weight_loader,
-            scale_dtype=params_dtype,
-        )
+        self.weight_scale: torch.Tensor | None
+        if self._is_fp8_storage:
+            self.weight_scale = create_fp8_scale_parameter(
+                PerTensorScaleParameter,
+                [self.num_embeddings_per_partition],
+                self.embedding_dim,
+                None,
+                self.weight_loader,
+                scale_dtype=params_dtype,
+            )
+        else:
+            # Unquantized storage carries no global scale.
+            self.weight_scale = None
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
         self._accelerator_weight_ptrs: dict[int, int] = {}
-        self._output_dtype = self.weight_scale.dtype
+        # FP8 rows are emitted at the scale dtype, unquantized rows as stored.
+        self._output_dtype = (
+            self.weight_scale.dtype
+            if self.weight_scale is not None
+            else self._meta_weight_dtype
+        )
+        # Every placement figure is in bytes of the storage dtype: one per
+        # element for FP8, two for an unquantized BF16/FP16 table.
+        self._row_bytes = self.embedding_dim * meta_weight.element_size()
         self._device_rows = 0
         self._host_rows = 0
         self._disk_rows = 0
@@ -839,10 +954,27 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         the rows beyond device and host are read from the mapped checkpoint on
         disk -- instead of overcommitting the device.
         """
-        row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
+        # Packed GGUF tables set _storage_dim; resident tables carry their
+        # storage row bytes; anything else is one byte per element (FP8).
+        row_bytes = getattr(
+            self, "_storage_dim", getattr(self, "_row_bytes", self.embedding_dim)
+        )
         total_rows = self._meta_weight_shape[0]
         table_bytes = total_rows * row_bytes
         runtime = get_current_vllm_config_or_none()
+        if not getattr(self, "_is_fp8_storage", True) and (
+            ple_cascade_configured()
+            or (runtime is not None and runtime.kernel_config.ple_disk_only)
+        ):
+            # The disk tier is read by the PLE offload worker as raw FP8 bytes
+            # and dequantized with the global scale; an unquantized table has
+            # neither, so it must not be split onto that tier.
+            raise NotImplementedError(
+                "Qwen4Exp unquantized PLE storage "
+                f"({self._meta_weight_dtype}) supports the device and "
+                "pinned-host tiers only; disable the PLE disk tier "
+                "(kernel_config.ple_disk_cascade / ple_disk_only)."
+            )
         if runtime and runtime.kernel_config.ple_disk_only:
             return plan_ple_placement(
                 total_rows=total_rows,
@@ -896,7 +1028,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return placement
 
     def materialize_tables(self) -> None:
-        """Allocate the device and host parts of the FP8 table (idempotent)."""
+        """Allocate the device and host parts of the table (idempotent)."""
         if self.ple_device_table is not None:
             return
         device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -926,14 +1058,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         logger.info(
             "Qwen4Exp PLE table placement: %d of %d rows in device memory "
             "(%s), %d rows in pinned host memory (%s), %d rows on the disk "
-            "tier (%s)",
+            "tier (%s), storage=%s",
             placement.vram_rows,
             placement.total_rows,
-            format_gib(placement.vram_rows * self.embedding_dim),
+            format_gib(placement.vram_rows * self._row_bytes),
             placement.host_rows,
-            format_gib(placement.host_rows * self.embedding_dim),
+            format_gib(placement.host_rows * self._row_bytes),
             placement.disk_rows,
-            format_gib(placement.disk_rows * self.embedding_dim),
+            format_gib(placement.disk_rows * self._row_bytes),
+            self._meta_weight_dtype,
         )
 
     def load_shard(
@@ -1035,7 +1168,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     def embedding_lookup(
         self, input_: torch.Tensor, remote_rows: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Gather FP8 rows from the device/host split, emit scaled values.
+        """Gather rows from the device/host split (FP8 rows come out scaled).
 
         Both gathers always run: branching on whether any id falls into the
         host half would need a device-to-host sync on every decode step. The
@@ -1062,6 +1195,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 "Qwen4Exp PLE rows live on the disk tier, but the lookup got "
                 "no rows from the PLE offload worker"
             )
+        if remote_rows is not None and self.weight_scale is None:
+            raise RuntimeError(
+                "Qwen4Exp PLE offload worker rows are raw FP8 bytes; unquantized "
+                "PLE storage cannot merge them"
+            )
         flat_ids = input_.reshape(-1)
         on_remote = None
         if remote_rows is not None:
@@ -1074,14 +1212,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         out_flat = output.reshape(-1, self.embedding_dim)
         if self._host_rows == 0 or self._device_rows == 0:
-            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-                flat_ids,
-                out_flat,
-                self.weight_scale,
-                self.layer_name,
-                self._host_rows != 0,
-                self.embedding_dim,
-            )
+            self._gather_rows(flat_ids, out_flat, self._host_rows != 0)
         else:
             boundary = self._device_rows
             on_host = flat_ids >= boundary
@@ -1089,22 +1220,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             device_ids = torch.where(on_host, zero, flat_ids)
             host_ids = torch.where(on_host, flat_ids - boundary, zero)
             host_out = torch.empty_like(out_flat)
-            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-                device_ids,
-                out_flat,
-                self.weight_scale,
-                self.layer_name,
-                False,
-                self.embedding_dim,
-            )
-            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-                host_ids,
-                host_out,
-                self.weight_scale,
-                self.layer_name,
-                True,
-                self.embedding_dim,
-            )
+            self._gather_rows(device_ids, out_flat, False)
+            self._gather_rows(host_ids, host_out, True)
             out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
         if on_remote is not None:
             assert remote_rows is not None
@@ -1124,6 +1241,28 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
             out_flat.copy_(torch.where(on_remote.unsqueeze(-1), remote_out, out_flat))
         return output
+
+    def _gather_rows(
+        self, ids: torch.Tensor, out: torch.Tensor, use_host_table: bool
+    ) -> None:
+        """Gather from one half of the table with the op for its storage."""
+        if self.weight_scale is None:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather_raw(
+                ids,
+                out,
+                self.layer_name,
+                use_host_table,
+                self.embedding_dim,
+            )
+        else:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                ids,
+                out,
+                self.weight_scale,
+                self.layer_name,
+                use_host_table,
+                self.embedding_dim,
+            )
 
 
 class Qwen4ExpNGramEmbedding(PleOffloadLayer):
@@ -1321,9 +1460,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         elif _should_use_pinned_host_ple(config):
             if quant_method is None:
-                raise NotImplementedError(
-                    "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"
-                )
+                if ple_storage_dtype.removeprefix("torch.") not in (
+                    _RAW_PLE_STORAGE_NAMES
+                ):
+                    raise NotImplementedError(
+                        "Qwen4Exp pinned-host PLE does not support "
+                        f"ple_embedding_dtype={ple_storage_dtype!r}"
+                    )
+                # Checkpoint ships the table unquantized: keep it on the same
+                # pinned-host UVA path at the model dtype (2 bytes/element).
+                quant_method = Qwen4ExpPLERawEmbeddingMethod()
             self.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 padded_vocab_size,
                 self.head_dim,
@@ -3891,6 +4037,54 @@ def qwen4_exp_ple_pinned_gather_fake(
     return
 
 
+def qwen4_exp_ple_pinned_gather_raw(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    use_host_table: bool,
+    embedding_dim: int,
+) -> None:
+    if input_ids.numel() == 0:
+        return
+    storage_dtype = _TRITON_STORAGE_DTYPES.get(output.dtype)
+    if storage_dtype is None:
+        raise NotImplementedError(
+            f"Qwen4Exp pinned-host PLE raw gather does not support {output.dtype}"
+        )
+    # Same contract as qwen4_exp_ple_pinned_gather: the table pointer is
+    # resolved here, inside the opaque op, never traced into a graph.
+    table = get_forward_context().no_compile_layers[layer_name]
+    if use_host_table:
+        device_index = (
+            torch.accelerator.current_device_index()
+            if input_ids.device.index is None
+            else input_ids.device.index
+        )
+        weight_ptr = table._accelerator_weight_ptrs[device_index]
+    else:
+        weight_ptr = table._device_table_ptr
+    block_d = triton.next_power_of_2(embedding_dim)
+    _gather_ple_raw_from_pinned_kernel[(input_ids.numel(),)](
+        weight_ptr,
+        input_ids,
+        output,
+        embedding_dim=embedding_dim,
+        BLOCK_D=block_d,
+        STORAGE_DTYPE=storage_dtype,
+        num_warps=4,
+    )
+
+
+def qwen4_exp_ple_pinned_gather_raw_fake(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    use_host_table: bool,
+    embedding_dim: int,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_fp8_bytes_dequant(
     input_bytes: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -3934,6 +4128,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_ple_pinned_gather,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_pinned_gather_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_pinned_gather_raw",
+    op_func=qwen4_exp_ple_pinned_gather_raw,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_pinned_gather_raw_fake,
 )
 
 
