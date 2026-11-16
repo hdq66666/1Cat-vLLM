@@ -527,8 +527,7 @@ def apply_runtime_policy_defaults(self):
                     model=None if host_kv else self.model_config.model,
                 )
                 logger.info_once(
-                    "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile "
-                    "lane: %s.",
+                    "Auto-enabling %s PLE for the SM70 Qwen3.8 dual-compile lane: %s.",
                     "disk-mmap" if host_gib is None else "hybrid",
                     "bounded result staging, no resident table"
                     if host_gib is None

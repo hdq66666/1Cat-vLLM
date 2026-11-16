@@ -553,7 +553,6 @@ def test_sm70_fast_path_takes_strided_state_slots(monkeypatch, lengths):
     not contiguous; the fast path must still run (the padded fallback holds
     num_prefills x the longest chunk x 10240 channels several times over)."""
     from vllm.model_executor.kernels.ple import short_conv
-
     from vllm.models.qwen4_exp.nvidia import ple_layer
 
     sm70 = torch.cuda.get_device_capability() == (7, 0)

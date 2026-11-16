@@ -473,8 +473,7 @@ def ple_storage_format_rejection(cfg) -> str | None:
     ]
     if any(method is None for method in methods):
         return (
-            "checkpoint metadata does not provide raw E4M3 or packed GGUF PLE "
-            "storage"
+            "checkpoint metadata does not provide raw E4M3 or packed GGUF PLE storage"
         )
     return None
 
