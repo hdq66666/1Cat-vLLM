@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """compressed-tensors NVFP4 W4A16 experts on native SM70.
 
-See patch_ctsm70moe.py for why this exists: the SM70 TurboMind NVFP4 MoE
-kernels are reachable only from the ModelOpt config path, but they are a pure
-W4A16 NVFP4 implementation and the compressed-tensors export carries the same
-packed uint8 weights and FP8 E4M3 block scales. Only the parameter names and
-the direction of the global scale differ, so this subclass creates the
-parameters under the checkpoint's names, renames them, and lets the SM70
-method do everything else.
+The SM70 TurboMind NVFP4 MoE kernels are reachable only from the ModelOpt
+config path, but they are a pure W4A16 NVFP4 implementation and the
+compressed-tensors export carries the same packed uint8 weights and FP8 E4M3
+block scales. Only the parameter names and the direction of the global scale
+differ, so this subclass creates the parameters under the checkpoint's names,
+renames them, and lets the SM70 method do everything else.
 """
 
 import torch
@@ -109,3 +108,21 @@ class CompressedTensorsNvFp4SM70MoEMethod(ModelOptNvFp4SM70MoEMethod):
         ):
             if hasattr(layer, leftover):
                 delattr(layer, leftover)
+
+
+def select_w4a16_turbomind_method(
+    moe: FusedMoEConfig,
+) -> CompressedTensorsNvFp4SM70MoEMethod | None:
+    """TurboMind W4A16 NVFP4 experts where no automatic backend serves them.
+
+    Marlin has no SM70 FP4 kernel image and the emulation backend is W4A4-only,
+    so W4A16 NVFP4 experts on exact SM70 go to the TurboMind kernels via the
+    ModelOpt-shaped path. Elsewhere this returns None and the generic
+    compressed-tensors selection applies unchanged.
+    """
+    from vllm.model_executor.layers.quantization import sm70_turbomind
+
+    if not sm70_turbomind.is_exact_sm70_cuda_platform():
+        return None
+    logger.info_once("Using CompressedTensorsNvFp4SM70MoEMethod")
+    return CompressedTensorsNvFp4SM70MoEMethod(moe)

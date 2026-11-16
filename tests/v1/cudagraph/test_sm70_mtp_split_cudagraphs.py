@@ -109,8 +109,6 @@ def test_split_managers_keep_exact_full_graph_shapes(
 
 
 def test_split_draft_manager_pads_small_batches_to_the_query_len(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1")
-    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "1")
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.is_cuda",
         lambda: True,
@@ -134,6 +132,8 @@ def test_split_draft_manager_pads_small_batches_to_the_query_len(monkeypatch):
 
     verifier_sizes = [5, 10, 15, 20, 25]
     config = _make_config(5, verifier_sizes)
+    # Graph policy, like split_draft_graphs; the legacy env name is an alias.
+    config.compilation_config.runtime.draft_pad_small_batches = True
     target = CudaGraphManager(
         config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, decode_query_len=5
     )

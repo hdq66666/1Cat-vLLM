@@ -4,13 +4,13 @@
 options.allow_request_directives): strictly validated, experiments only."""
 
 import pytest
-from vllm.v1.simple_kv_offload.options import parse_options
 
 from vllm.v1.simple_kv_offload.manager import (
     CONTROLS,
     Directives,
     parse_directives,
 )
+from vllm.v1.simple_kv_offload.options import parse_options
 
 pytestmark = pytest.mark.cpu_test
 
@@ -27,14 +27,14 @@ def test_directives_are_parsed():
             "simple_cpu": {
                 "corrupt": "nan_v_tail=4",
                 "gate": True,
-                "control": {"qsa_grouped_page4": 0, "compute_nans_in_logits": "1"},
+                "control": {"copy_backend": "memcpy"},
             }
         }
     )
     assert got == Directives(
         corrupt="nan_v_tail=4",
         gate=True,
-        controls=(("qsa_grouped_page4", "0"), ("compute_nans_in_logits", "1")),
+        controls=(("copy_backend", "memcpy"),),
     )
     assert parse_directives({"simple_cpu": {"gate": False}}) == Directives()
 
@@ -48,7 +48,8 @@ def test_directives_are_parsed():
         ({"corrupt": "nan_v=0"}, "count"),
         ({"gate": "yes"}, "gate must be a boolean"),
         ({"control": {"reboot": "1"}}, "not allowed"),
-        ({"control": {"qsa_grouped_page4": "maybe"}}, "not allowed"),
+        ({"control": {"copy_backend": "maybe"}}, "not allowed"),
+        ({"control": {"qsa_grouped_page4": "0"}}, "not allowed"),
     ],
 )
 def test_directives_are_rejected(entry, match):
@@ -57,12 +58,7 @@ def test_directives_are_rejected(entry, match):
 
 
 def test_controls_have_two_states():
-    assert set(CONTROLS) == {
-        "qsa_grouped_page4",
-        "qsa_grouped_pad_fix",
-        "compute_nans_in_logits",
-        "copy_backend",
-    }
+    assert set(CONTROLS) == {"copy_backend"}
     assert CONTROLS["copy_backend"] == ("batch", "memcpy")
     assert all(len(values) == 2 for values in CONTROLS.values())
 

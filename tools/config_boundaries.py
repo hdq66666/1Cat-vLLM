@@ -199,6 +199,14 @@ DYNAMIC_DOMAINS[("vllm/config/sm70_runtime.py", "RuntimeTraceConfig.__post_init_
     "initialization",
     "RuntimeTraceConfig.legacy_layer_aliases source provenance",
 )
+# SimpleCPUOffload fault-injection switches: read once while the connector,
+# scheduler, worker and model runner are constructed, and refused unless
+# VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE is set.
+for _scope in ("test_switch", "check_test_switches"):
+    DYNAMIC_DOMAINS[("vllm/v1/simple_kv_offload/options.py", _scope)] = (
+        "initialization",
+        "_TEST_SWITCHES in vllm/v1/simple_kv_offload/options.py",
+    )
 
 # These are upstream process/environment transport, introspection or unrelated
 # connectors. Their names are dynamic by design and are outside 1Cat strategies.

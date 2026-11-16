@@ -535,33 +535,13 @@ class SimpleCPUOffloadWorker:
         self._connector_metadata = None
 
     def _apply_controls(self, controls: dict[str, str]) -> None:
-        """Runtime controls from request directives (experiments): flip the
-        SM70 QSA grouped page4 route or its padding fix, or the NaN count
-        of the logits, in this worker process without a restart."""
-        import importlib
-        import os
-
+        """Runtime controls from request directives (experiments): switch the
+        copy backend in this worker process without a restart."""
         for name, value in controls.items():
             if self._controls.get(name) == value:
                 continue
-            if name in ("qsa_grouped_page4", "qsa_grouped_pad_fix"):
-                qsa = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa")
-                attr = (
-                    "_SM70_QSA_GROUPED_PAGE4"
-                    if name == "qsa_grouped_page4"
-                    else "_SM70_QSA_GROUPED_PAD_FIX"
-                )
-                setattr(qsa, attr, value == "1")
-            elif name == "copy_backend":
+            if name == "copy_backend":
                 self._backend.set_mode(value)
-            elif name == "compute_nans_in_logits":
-                os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = value
-                # envs values are cached once the service is up
-                # (enable_envs_cache in the worker process): drop the cache
-                # so the model runner's next read sees the new value.
-                cache_clear = getattr(envs.__getattr__, "cache_clear", None)
-                if cache_clear is not None:
-                    cache_clear()
             else:
                 logger.warning("SimpleCPU control %s=%s: unknown, ignored", name, value)
                 continue
@@ -574,21 +554,9 @@ class SimpleCPUOffloadWorker:
                 self._control_status(),
             )
 
-    @staticmethod
-    def _control_status() -> str:
-        """The SM70 QSA grouped page4 route's call count and switches: the
-        count stops moving once the route is off."""
-        import importlib
-
-        try:
-            qsa = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa")
-        except Exception:
-            return "qsa=unavailable"
-        return (
-            f"grouped_page4_calls={getattr(qsa, '_SM70_QSA_GROUPED_PAGE4_CALLS', '?')}"
-            f" grouped={getattr(qsa, '_SM70_QSA_GROUPED_PAGE4', '?')}"
-            f" pad_fix={getattr(qsa, '_SM70_QSA_GROUPED_PAD_FIX', '?')}"
-        )
+    def _control_status(self) -> str:
+        """The copy path later transfers take."""
+        return f"copy_backend={self._backend.mode}"
 
     def start_load_kv(self) -> None:
         # NOTE: we defer launching both load and store to get_finished(),

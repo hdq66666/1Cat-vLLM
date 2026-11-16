@@ -15,7 +15,6 @@ from unittest import mock
 import msgspec
 import pytest
 import torch
-from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -26,6 +25,7 @@ from vllm.v1.simple_kv_offload import worker as worker_mod
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, TransferEvent
 from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
 from vllm.v1.simple_kv_offload.stats import (
     LOAD_BLOCKS,
     LOAD_BYTES,
@@ -966,51 +966,33 @@ def test_gate_times_out_into_a_clean_load(make_worker) -> None:
     assert not worker._gated_loads
 
 
-def test_controls_are_applied_once_per_value(make_worker, monkeypatch) -> None:
+def test_controls_are_applied_once_per_value(make_worker) -> None:
     worker = _mock_worker()
-    applied: list[tuple[str, str]] = []
+    modes: list[str] = []
 
-    class FakeQSA:
-        _SM70_QSA_GROUPED_PAGE4 = True
-        _SM70_QSA_GROUPED_PAD_FIX = True
-        _SM70_QSA_GROUPED_PAGE4_CALLS = 7
+    class FakeBackend:
+        mode = "batch"
 
-    import sys
+        def set_mode(self, mode: str) -> str:
+            modes.append(mode)
+            self.mode = mode
+            return mode
 
-    monkeypatch.setitem(sys.modules, "vllm.models.qwen4_exp.nvidia.ops.qsa", FakeQSA)
-    monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0")
-    # The service caches envs values after start-up (worker processes too):
-    # a control must still reach the model runner's next read.
-    import vllm.envs as envs
-
-    envs.enable_envs_cache()
-    assert envs.VLLM_COMPUTE_NANS_IN_LOGITS is False
-    meta = SimpleCPUOffloadMetadata(
-        controls={"qsa_grouped_page4": "0", "compute_nans_in_logits": "1", "x": "1"}
-    )
+    worker._backend = FakeBackend()
+    meta = SimpleCPUOffloadMetadata(controls={"copy_backend": "memcpy", "x": "1"})
     worker.bind_connector_metadata(meta)
     worker.clear_connector_metadata()
-    assert FakeQSA._SM70_QSA_GROUPED_PAGE4 is False
-    import os
-
-    assert os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] == "1"
-    assert envs.VLLM_COMPUTE_NANS_IN_LOGITS is True
-    envs.disable_envs_cache()
-    assert worker._controls == {"qsa_grouped_page4": "0", "compute_nans_in_logits": "1"}
-    FakeQSA._SM70_QSA_GROUPED_PAGE4 = True  # the same value again is a no-op
+    assert modes == ["memcpy"]
+    # Unknown controls are logged and not recorded.
+    assert worker._controls == {"copy_backend": "memcpy"}
+    # The same value again is a no-op.
+    worker.bind_connector_metadata(meta)
+    assert modes == ["memcpy"]
     worker.bind_connector_metadata(
-        SimpleCPUOffloadMetadata(controls={"qsa_grouped_page4": "0"})
+        SimpleCPUOffloadMetadata(controls={"copy_backend": "batch"})
     )
-    assert FakeQSA._SM70_QSA_GROUPED_PAGE4 is True
-    worker.bind_connector_metadata(
-        SimpleCPUOffloadMetadata(controls={"qsa_grouped_page4": "1"})
-    )
-    assert (
-        FakeQSA._SM70_QSA_GROUPED_PAGE4 is True
-        and worker._controls["qsa_grouped_page4"] == "1"
-    )
-    assert "grouped_page4_calls=7" in worker._control_status()
-    del applied
+    assert modes == ["memcpy", "batch"]
+    assert worker._control_status() == "copy_backend=batch"
 
 
 def test_gate_fails_a_load_damaged_by_a_cpu_corrupt_directive(make_worker) -> None:

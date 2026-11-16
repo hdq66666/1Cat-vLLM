@@ -478,6 +478,36 @@ def ple_storage_format_rejection(cfg) -> str | None:
     return None
 
 
+_RESIDENT_PLE_LANE_MESSAGES = {
+    "dual_compile": (
+        "Not auto-enabling the SM70 Qwen3.8 dual-compile lane: %s. It is "
+        "qualified with disk/hybrid PLE only; set "
+        "VLLM_SM70_QWEN38_DUAL_COMPILE=1 to override."
+    ),
+    "disk_ple": (
+        "Keeping resident PLE tiers with the SM70 Qwen3.8 dual-compile lane: %s."
+    ),
+}
+
+
+def resident_ple_lane_rejection(cfg, lane: str) -> str | None:
+    """Why a default must not move this checkpoint's PLE off its resident tiers.
+
+    The dual-compile lane and its disk-mmap/hybrid PLE defaults serve raw E4M3
+    or packed GGUF rows; unquantized (BF16/FP16) tables stay on the device and
+    pinned-host tiers. Returns None (default unchanged) for models without PLE
+    layers and for E4M3/GGUF storage; otherwise logs and returns the reason.
+    Only the storage format decides; partition constraints keep their checks.
+    """
+    text = getattr(cfg.model_config, "hf_text_config", None)
+    if not getattr(text, "ple_layer_ids", None):
+        return None
+    reason = ple_storage_format_rejection(cfg)
+    if reason is not None:
+        logger.info_once(_RESIDENT_PLE_LANE_MESSAGES[lane], reason)
+    return reason
+
+
 def sparse_execution_family(model_config):
     """Declare which existing sparse provider the model can consume."""
     text = getattr(model_config, "hf_text_config", None)

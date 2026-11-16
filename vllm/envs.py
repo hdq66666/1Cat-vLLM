@@ -10936,13 +10936,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier",),
         user_visible=True,
     ),
-    # With split draft graphs, run two to four concurrent single-token draft
-    # steps on the five-row graph instead of graphs of their own size. The
-    # drafter's MoE has a tuned tile and a native kernel only for one row and
-    # for five (the first draft pass of one request); in between it falls back
-    # to the generic tile.
-    "VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "0"))
+    "VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES", "0"))),
+        description=(
+            "Legacy input for compilation_config.runtime.draft_pad_small_batches. "
+            "With split MTP draft graphs, run two to four concurrent single-token "
+            "draft steps on the verifier-width draft graph, the row counts the "
+            "drafter MoE is tuned for, instead of graphs of their own size."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP draft",),
+        user_visible=True,
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
@@ -17198,14 +17205,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # they reach the chat template, for templates that accept fewer levels
     # than OpenAI defines. Example: '{"high": "xhigh", "minimal": "low"}'.
     # Values not in the map are passed through unchanged.
-    "VLLM_RESPONSES_REASONING_EFFORT_MAP": lambda: os.getenv(
-        "VLLM_RESPONSES_REASONING_EFFORT_MAP", ""
+    "VLLM_RESPONSES_REASONING_EFFORT_MAP": env_var(
+        lambda: os.getenv("VLLM_RESPONSES_REASONING_EFFORT_MAP", ""),
+        description=(
+            "JSON object that renames Responses API reasoning.effort values "
+            "before they reach the chat template, for templates that accept fewer "
+            'levels than OpenAI defines, e.g. {"high": "xhigh"}. Unmapped '
+            "values pass through unchanged; empty disables the mapping."
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''; no reasoning.effort mapping",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
     ),
     # Seconds of silence after which a streaming /v1/responses response
     # sends an SSE comment, so clients and proxies with idle timeouts do not
     # drop a request that is queued or in a long prefill. 0 disables it.
-    "VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL": lambda: float(
-        os.getenv("VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL", "0")
+    "VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL": env_var(
+        lambda: float(os.getenv("VLLM_RESPONSES_SSE_KEEP_ALIVE_INTERVAL", "0")),
+        description=(
+            "Seconds of silence after which a streaming /v1/responses response "
+            "sends an SSE comment, so clients and proxies with idle timeouts keep "
+            "a request that is queued or in a long prefill. 0 disables it."
+        ),
+        category="configuration",
+        declared_default="0.0",
+        effective_default="0.0; keep-alive comments disabled",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, use the fp8 mfma in rocm paged attention.
     "VLLM_ROCM_FP8_MFMA_PAGE_ATTN": env_var(
@@ -18203,34 +18233,112 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SimpleCPUOffloadConnector transfer verification: "off", "sample" (check
     # a few blocks of every transfer) or "all". Compares GPU pages with their
     # CPU copies after loads/stores complete; blocking, diagnostics only.
-    "VLLM_SIMPLE_KV_OFFLOAD_VERIFY": env_with_choices(
-        "VLLM_SIMPLE_KV_OFFLOAD_VERIFY", "off", ["off", "sample", "all"]
+    "VLLM_SIMPLE_KV_OFFLOAD_VERIFY": env_var(
+        env_with_choices(
+            "VLLM_SIMPLE_KV_OFFLOAD_VERIFY", "off", ["off", "sample", "all"]
+        ),
+        description=(
+            "SimpleCPUOffloadConnector transfer verification: off, sample (a few "
+            "blocks of every transfer) or all. Compares GPU pages with their CPU "
+            "copies after loads and stores complete; blocking, diagnostics only."
+        ),
+        category="debug",
+        declared_default="'off'",
+        effective_default="'off'; no transfer verification",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
     ),
     # Gate for the SimpleCPUOffloadConnector fault-injection switches below.
     # They are refused at startup unless this is set.
-    "VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE": lambda: bool(
-        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE", "0"))
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE", "0"))),
+        description=(
+            "Gate for the SimpleCPUOffloadConnector fault-injection switches; "
+            "they read as off unless this is set. Tests only."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Test only: launch CPU->GPU loads without ordering them behind the
     # compute stream (negative control for the load-ordering fix).
-    "VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD": lambda: bool(
-        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD", "0"))
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_UNORDERED_LOAD", "0"))),
+        description=(
+            "Test only (needs VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE): launch CPU to "
+            "GPU loads without ordering them behind the compute stream, the "
+            "negative control for the load-ordering fix."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Test only: zero the destination blocks of async KV loads as well.
-    "VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO": lambda: bool(
-        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO", "0"))
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO": env_var(
+        lambda: bool(int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO", "0"))),
+        description=(
+            "Test only (needs VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE): zero the "
+            "destination blocks of async KV loads as well."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Test only: make the SimpleCPUOffload copy thread raise on its next copy.
-    "VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY": lambda: bool(
-        int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY", "0"))
+    "VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_TEST_FAIL_COPY", "0"))),
+        description=(
+            "Test only (needs VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE): make the "
+            "SimpleCPUOffload copy thread raise on its next copy."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Test only: GPU sleep cycles enqueued on the compute stream right before
     # new KV blocks are zeroed / right before async KV loads are launched.
-    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES": lambda: int(
-        os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES", "0")
+    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES": env_var(
+        lambda: int(os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_ZERO_DELAY_CYCLES", "0")),
+        description=(
+            "Test only (needs VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE): GPU sleep cycles "
+            "enqueued on the compute stream right before new KV blocks are "
+            "zeroed."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
-    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES": lambda: int(
-        os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES", "0")
+    "VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES": env_var(
+        lambda: int(
+            os.getenv("VLLM_SIMPLE_KV_OFFLOAD_DEBUG_COMPUTE_DELAY_CYCLES", "0")
+        ),
+        description=(
+            "Test only (needs VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE): GPU sleep cycles "
+            "enqueued on the compute stream right before async KV loads are "
+            "launched."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

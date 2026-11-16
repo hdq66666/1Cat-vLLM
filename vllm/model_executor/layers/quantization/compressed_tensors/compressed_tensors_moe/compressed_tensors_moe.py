@@ -138,20 +138,15 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 )
             use_a16 = input_quant is None
             if use_a16:
-                from vllm.model_executor.layers.quantization import (
-                    sm70_turbomind as _sm70_tm,
+                # W4A16 experts the generic backends cannot serve on this
+                # device take the TurboMind provider (None elsewhere).
+                from .compressed_tensors_moe_nvfp4_turbomind import (
+                    select_w4a16_turbomind_method,
                 )
 
-                if _sm70_tm.is_exact_sm70_cuda_platform():
-                    # Marlin has no SM70 FP4 kernel image and the emulation
-                    # backend is W4A4-only, so W4A16 NVFP4 experts on SM70 go
-                    # to the TurboMind kernels via the ModelOpt-shaped path.
-                    from .compressed_tensors_moe_nvfp4_sm70 import (
-                        CompressedTensorsNvFp4SM70MoEMethod,
-                    )
-
-                    logger.info_once("Using CompressedTensorsNvFp4SM70MoEMethod")
-                    return CompressedTensorsNvFp4SM70MoEMethod(layer.moe_config)
+                turbomind_method = select_w4a16_turbomind_method(layer.moe_config)
+                if turbomind_method is not None:
+                    return turbomind_method
             return CompressedTensorsW4A4Nvfp4MoEMethod(
                 layer.moe_config, layer_name, use_a16=use_a16
             )

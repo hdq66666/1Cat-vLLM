@@ -5,9 +5,9 @@ stay silent on a faithful transfer and name the stage that broke otherwise."""
 
 import pytest
 import torch
-from vllm.v1.simple_kv_offload.options import parse_options
 
 from vllm.v1.simple_kv_offload.fingerprint import WATCH_STEPS, FingerprintChain
+from vllm.v1.simple_kv_offload.options import parse_options
 
 NUM_GPU, NUM_CPU, REGIONS = 12, 20, {"fa": 64, "state": 40}
 

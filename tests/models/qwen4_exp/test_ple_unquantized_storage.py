@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.model_executor.models.runtime_defaults as model_defaults
 from vllm.models.qwen4_exp.nvidia import ple_layer as ple
-from vllm.platforms import runtime_defaults
 
 Embedding = ple.Qwen4ExpPinnedHostEmbedding
 ROWS, DIM = 100, 4
@@ -64,31 +64,39 @@ def _cfg(ple_layer_ids):
     return SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text))
 
 
-def test_runtime_defaults_ignore_models_without_ple(monkeypatch):
+def test_resident_ple_guard_ignores_models_without_ple(monkeypatch):
     def unexpected(_cfg):
         raise AssertionError("storage is only inspected for PLE models")
 
-    import vllm.model_executor.models.runtime_defaults as model_defaults
-
     monkeypatch.setattr(model_defaults, "ple_storage_format_rejection", unexpected)
-    assert runtime_defaults._qwen4exp_ple_storage_rejection(_cfg(None)) is None
-    assert runtime_defaults._qwen4exp_ple_storage_rejection(_cfg([])) is None
+    for lane in ("dual_compile", "disk_ple"):
+        assert model_defaults.resident_ple_lane_rejection(_cfg(None), lane) is None
+        assert model_defaults.resident_ple_lane_rejection(_cfg([]), lane) is None
 
 
+@pytest.mark.parametrize("lane", ["dual_compile", "disk_ple"])
 @pytest.mark.parametrize("reason", [None, "no raw E4M3 PLE storage"])
-def test_runtime_defaults_follow_ple_storage_format(monkeypatch, reason):
-    import vllm.model_executor.models.runtime_defaults as model_defaults
-
+def test_resident_ple_guard_follows_the_storage_format(monkeypatch, lane, reason):
+    logged: list[str] = []
     monkeypatch.setattr(
         model_defaults, "ple_storage_format_rejection", lambda _c: reason
     )
-    assert runtime_defaults._qwen4exp_ple_storage_rejection(_cfg([3, 7])) == reason
+    monkeypatch.setattr(
+        model_defaults.logger,
+        "info_once",
+        lambda msg, *args, **_kw: logged.append(msg % args),
+    )
+    got = model_defaults.resident_ple_lane_rejection(_cfg([3, 7]), lane)
+    assert got == reason
+    # A rejection is visible in the log with its reason; acceptance is silent.
+    assert logged == ([] if reason is None else [logged[0]])
+    if reason is not None:
+        assert reason in logged[0]
 
 
 def test_ple_storage_rejection_keeps_the_partition_check_first(monkeypatch):
     # The lane guard reads only the storage format; the cascade keeps the
     # pipeline-partition check ahead of it.
-    import vllm.model_executor.models.runtime_defaults as model_defaults
     import vllm.models.qwen4_exp.common.ple as common_ple
 
     cfg = _cfg([3, 7])
@@ -134,6 +142,6 @@ def test_raw_gather_kernel_returns_stored_rows(dtype, pinned_host):
         STORAGE_DTYPE=ple._TRITON_STORAGE_DTYPES[dtype],
         num_warps=4,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     expected = table.cuda().index_select(0, ids)
     assert torch.equal(out, expected)

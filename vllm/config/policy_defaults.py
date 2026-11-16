@@ -242,6 +242,7 @@ def finalize_runtime_policy_hashes(cfg):
             graph_fields.append("dual_compile")
         if getattr(spec, "method", None) == "mtp":
             graph_fields.append("split_draft_graphs")
+            graph_fields.append("draft_pad_small_batches")
     # Explicit bucket overrides historically apply even on a simulated/non-SM70
     # platform. Fingerprint only the features that can consume each choice.
     from vllm.model_executor.models.graph_contract import model_graph_contract

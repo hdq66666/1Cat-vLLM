@@ -111,10 +111,10 @@ class TransferMeta:
 
 # Runtime controls a request directive may flip in every worker
 # (SimpleCPUOffloadWorker._apply_controls), with their accepted values.
+# The fork's QSA route switches and the logits NaN-count switch were dropped
+# when porting onto 1CatAI main: their targets moved into typed policy, and a
+# control that changed nothing would fail silently.
 CONTROLS = {
-    "qsa_grouped_page4": ("0", "1"),
-    "qsa_grouped_pad_fix": ("0", "1"),
-    "compute_nans_in_logits": ("0", "1"),
     "copy_backend": ("batch", "memcpy"),
 }
 DIRECTIVE_KEY = "simple_cpu"

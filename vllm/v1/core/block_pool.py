@@ -491,6 +491,8 @@ class BlockPool:
     def _pop_quarantined(self, num_blocks: int) -> list[KVCacheBlock]:
         """Pop free blocks in queue order, skipping blocks freed within the
         last quarantine_steps steps while older ones are available."""
+        # get_new_blocks() routes partitioned pools around the quarantine.
+        assert isinstance(self.free_block_queue, FreeKVCacheBlockQueue)
         oldest_ok = self.current_step - self.quarantine_steps
         ret: list[KVCacheBlock] = []
         node = self.free_block_queue.fake_free_list_head.next_free_block

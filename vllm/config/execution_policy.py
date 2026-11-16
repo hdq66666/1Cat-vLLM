@@ -240,6 +240,12 @@ class GraphPolicy(ExecutionPolicy):
     split_draft_graphs: bool | None = None
     """Capture MTP draft graphs independently of verifier width."""
 
+    draft_pad_small_batches: bool | None = None
+    """With split draft graphs, run request counts between one and the
+    verifier width on the verifier-width draft graph instead of graphs of
+    their own size. For drafters whose MoE is tuned only for one row and for
+    the verifier width; default off."""
+
     estimate_graph_memory: bool | None = None
     """Use the existing graph memory admission estimator."""
 
@@ -258,6 +264,7 @@ class GraphPolicy(ExecutionPolicy):
         "eliminate_noops": "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS",
         "dual_compile": "VLLM_SM70_QWEN38_DUAL_COMPILE",
         "split_draft_graphs": "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS",
+        "draft_pad_small_batches": "VLLM_SM70_MTP_DRAFT_PAD_SMALL_BATCHES",
         "estimate_graph_memory": "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
         "mtp_context_buckets": "VLLM_SM70_MTP_CONTEXT_BUCKETS",
         "dsv4_context_buckets": "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS",
