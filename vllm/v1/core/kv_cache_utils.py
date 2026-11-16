@@ -136,6 +136,13 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Bumped every time the block is allocated from the free queue, so a
+    # caller can tell two residencies of the same block (and hash) apart.
+    alloc_generation: int = 0
+    # BlockPool.current_step when the block was last freed (-1: never), so
+    # a caller can tell how long a free block has been out of use.
+    freed_at_step: int = -1
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

@@ -3,10 +3,14 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
-from collections.abc import Iterable
+import time
+from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from math import gcd
 from typing import TYPE_CHECKING, Any
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -17,26 +21,86 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
-from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    MambaSpec,
-    SlidingWindowSpec,
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    FreeKVCacheBlockQueue,
+    get_block_hash,
+    get_group_id,
+    make_block_hash_with_group_id,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.fingerprint import BLOCK_UNKNOWN
+from vllm.v1.simple_kv_offload.host_mem import GiB, read_mem_available_bytes
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
 )
+from vllm.v1.simple_kv_offload.options import SimpleCPUOffloadOptions
+from vllm.v1.simple_kv_offload.stats import (
+    CPU_BLOCKS_QUARANTINED,
+    CPU_CACHED_BLOCKS_LAST,
+    CPU_HIT_WAIT_S_MAX,
+    CPU_HITS_COLD_FALLBACK,
+    CPU_HITS_DEFERRED,
+    CPU_HITS_REFUSED,
+    CPU_USED_BLOCKS_LAST,
+    HOST_MEM_AVAILABLE_GIB_MIN,
+    INFLIGHT_SKIPPED,
+    LOAD_DST_RECENTLY_FREED,
+    LOAD_DST_YOUNG,
+    LOAD_FAILED_BLOCKS,
+    LOAD_FAILED_REQUESTS,
+    LOAD_PROTECTED_BLOCKS,
+    LOAD_REQUESTS,
+    PROTECT_CAPPED,
+    PROTECT_EXPIRED,
+    PROTECT_GRANTED,
+    PROTECTED_CPU_BLOCKS_LAST,
+    PROTECTED_HASHES_LAST,
+    QUARANTINE_FALLBACKS_LAST,
+    QUARANTINE_SKIPPED,
+    RESERVE_STOPS,
+    RESTORE_SKIPPED,
+    STORE_PINS_LAST,
+    STORES_SELECTED,
+    SimpleCPUOffloadStats,
+)
 
 if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+    from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Lazy mode: steps that schedule no tokens (idle drain) select this many
+# times max_store_blocks_per_step.
+IDLE_STORE_MULTIPLIER = 8
+# Seconds between two host MemAvailable samples.
+HOST_MEM_CHECK_INTERVAL_S = 60.0
+# Seconds between two ERROR lines about refused CPU hits.
+REFUSED_HIT_LOG_INTERVAL_S = 60.0
+# A load destination freed by a request that finished within this many
+# scheduler steps counts as LOAD_DST_RECENTLY_FREED.
+RECENTLY_FREED_STEPS = 2
+# Prefix protection: seconds between two summary lines, and between two
+# sweeps of the hit history for hashes not hit within the window.
+PROTECT_LOG_INTERVAL_S = 60.0
+PROTECT_PRUNE_INTERVAL_S = 60.0
+
+
+def _ranges(ids: list[int]) -> str:
+    """Compact "a-b,c,d-e" rendering of a block id list (log lines)."""
+    out: list[list[int]] = []
+    for i in sorted(ids):
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return ",".join(f"{a}-{b}" if a != b else str(a) for a, b in out)
 
 
 @dataclass
@@ -45,12 +109,99 @@ class TransferMeta:
     cpu_block_ids: list[int]
 
 
+# Runtime controls a request directive may flip in every worker
+# (SimpleCPUOffloadWorker._apply_controls), with their accepted values.
+CONTROLS = {
+    "qsa_grouped_page4": ("0", "1"),
+    "qsa_grouped_pad_fix": ("0", "1"),
+    "compute_nans_in_logits": ("0", "1"),
+    "copy_backend": ("batch", "memcpy"),
+}
+DIRECTIVE_KEY = "simple_cpu"
+
+
+@dataclass(frozen=True)
+class Directives:
+    """The "simple_cpu" entry of a request's kv_transfer_params, honoured
+    only with options.allow_request_directives (experiments):
+      {"corrupt": "<mode>[=N]"}  damage this request's own load like
+                                 fingerprint_corrupt_plan (fingerprint
+                                 CORRUPT_MODES)
+      {"gate": true}             report the load to the scheduler only with
+                                 the fingerprint verdict; a bad verdict
+                                 fails the load (the blocks are recomputed)
+      {"control": {name: "0"|"1"}}  flip a runtime control in every worker
+                                 (CONTROLS), with or without a CPU hit
+    """
+
+    corrupt: str = ""
+    gate: bool = False
+    controls: tuple[tuple[str, str], ...] = ()
+
+
+def parse_directives(params: dict[str, Any] | None) -> Directives | None:
+    """Validate a request's kv_transfer_params["simple_cpu"]; None without
+    one. Raises ValueError on anything unknown."""
+    if not params:
+        return None
+    entry = params.get(DIRECTIVE_KEY)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError(f"kv_transfer_params[{DIRECTIVE_KEY!r}] must be an object")
+    unknown = set(entry) - {"corrupt", "gate", "control"}
+    if unknown:
+        raise ValueError(f"unknown {DIRECTIVE_KEY} directives: {sorted(unknown)}")
+    corrupt = str(entry.get("corrupt") or "")
+    if corrupt:
+        from vllm.v1.simple_kv_offload.fingerprint import parse_corrupt_mode
+
+        parse_corrupt_mode(corrupt)
+    gate = entry.get("gate", False)
+    if not isinstance(gate, bool):
+        raise ValueError(f"{DIRECTIVE_KEY}.gate must be a boolean")
+    controls: list[tuple[str, str]] = []
+    for name, value in (entry.get("control") or {}).items():
+        value = str(value)
+        if name not in CONTROLS or value not in CONTROLS[name]:
+            raise ValueError(f"{DIRECTIVE_KEY}.control {name}={value!r} is not allowed")
+        controls.append((name, value))
+    return Directives(corrupt=corrupt, gate=gate, controls=tuple(controls))
+
+
 @dataclass
 class LoadRequestState:
     request: "Request"
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
+    # Block kinds parallel to transfer_meta.gpu_block_ids (the KV cache
+    # group of each block, see fingerprint) and the request's directives.
+    kinds: list[int] = field(default_factory=list)
+    directives: Directives | None = None
+    # For the admission / completion log lines.
+    num_local_hit_tokens: int = 0
+    num_cpu_hit_tokens: int = 0
+    emit_step: int = 0
+    emit_time: float = 0.0
+    # GPU blocks the request's first compute step after the load takes;
+    # reserved against later CPU hit admissions while the load is in flight.
+    need_next: int = 0
+    # (free, need_hit, need_next, margin, need_cold) the admission check saw.
+    admission: tuple[int, int, int, int, int] | None = None
+
+
+@dataclass
+class PendingCPUHit:
+    """A CPU hit reported by get_num_new_matched_tokens(), pinned via touch()
+    until update_state_after_alloc() consumes it."""
+
+    blocks: tuple[list["KVCacheBlock"], ...]
+    num_tokens: int
+    # GPU-local prefix hit the CPU hit continues from.
+    num_local_tokens: int
+    need_next: int = 0
+    admission: tuple[int, int, int, int, int] | None = None
 
 
 # NOTE: This per-request state is only used in eager mode.
@@ -76,8 +227,10 @@ class SimpleCPUOffloadScheduler:
         scheduler_block_size: int,
         hash_block_size: int,
         lazy_offload: bool = False,
+        options: SimpleCPUOffloadOptions | None = None,
     ):
         self.vllm_config = vllm_config
+        self.options = options or SimpleCPUOffloadOptions(lazy_offload=lazy_offload)
         self.kv_cache_config = kv_cache_config
         self.enable_kv_cache_events = (
             vllm_config.kv_events_config is not None
@@ -92,19 +245,6 @@ class SimpleCPUOffloadScheduler:
             kv_cache_config, cpu_capacity_bytes
         )
         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
-        # Find the full attention kv group for prefix cache matching.
-        self.fa_gidx = -1
-        for g_idx, g in enumerate(self.cpu_kv_cache_config.kv_cache_groups):
-            if isinstance(g.kv_cache_spec, FullAttentionSpec):
-                self.fa_gidx = g_idx
-                break
-        assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
-        # FA group's own block_size; divides scheduler_block_size (the LCM)
-        # but is NOT assumed to equal it.
-        self.fa_block_size: int = self.cpu_kv_cache_config.kv_cache_groups[
-            self.fa_gidx
-        ].kv_cache_spec.block_size
-        assert self.block_size % self.fa_block_size == 0
 
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
@@ -117,11 +257,17 @@ class SimpleCPUOffloadScheduler:
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         assert dcp_world_size == 1 and pcp_world_size == 1
+        # Same EAGLE/MTP last-block drop as the GPU coordinator, so a CPU hit
+        # never covers a page the GPU side would recompute.
+        speculative_config = vllm_config.speculative_config
+        use_eagle = (
+            speculative_config is not None and speculative_config.use_eagle_kv_cache()
+        )
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            use_eagle=False,
+            use_eagle=use_eagle,
             enable_caching=True,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
@@ -132,18 +278,45 @@ class SimpleCPUOffloadScheduler:
 
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
+        # The scheduler's KVCacheManager (bound with the pool): its allocator
+        # estimates what a CPU hit takes on the GPU. Without it CPU hits are
+        # admitted unconditionally.
+        self._gpu_kv_cache_manager: KVCacheManager | None = None
 
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
         # Inverse map: load_event_idx -> req_ids. Keyed by load_event_idx because
         # the worker reports completions by event index, not request id.
         self._load_event_to_reqs: dict[int, list[str]] = {}
+        # Per pending load event (metadata.load_spans / load_corrupt /
+        # load_gate): each request's block span, the corrupt directives and
+        # whether the event is gated on the fingerprint verdict.
+        self._load_spans: dict[int, list[tuple[int, int]]] = {}
+        self._load_corrupt: dict[int, list[tuple[int, int, str]]] = {}
+        self._load_gate: dict[int, bool] = {}
+        # Runtime controls requested by directives, sent with the next step.
+        self._pending_controls: dict[str, str] = {}
+        # CPU blocks taken out of circulation after a bad gated load.
+        self._quarantined: set[int] = set()
 
-        # Pending (cpu_hit_blocks, hit_length) tuples from find_longest_cache_hit,
-        # kept pinned via touch() while awaiting update_state_after_alloc().
-        self._pending_cpu_hits: dict[
-            str, tuple[tuple[list[KVCacheBlock], ...], int]
-        ] = {}
+        # CPU hits found by get_num_new_matched_tokens(), kept pinned via
+        # touch() while awaiting update_state_after_alloc().
+        self._pending_cpu_hits: dict[str, PendingCPUHit] = {}
+        # CPU hit admission: request id -> time of its first deferral, and the
+        # requests that waited too long and are prefilled from scratch.
+        self._deferred_hits: dict[str, float] = {}
+        self._cold_fallback_req_ids: set[str] = set()
+        # Requests scheduled in the last step (the default admission margin).
+        self._num_running_last_step = 0
+        self._use_eagle = use_eagle
+        self._num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        self._max_model_len = vllm_config.model_config.max_model_len
+        scheduler_config = vllm_config.scheduler_config
+        self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        self._long_prefill_token_threshold = (
+            scheduler_config.long_prefill_token_threshold
+        )
+        self._reserve_full_isl = scheduler_config.scheduler_reserve_full_isl
 
         # Store metadata
         self._lazy_mode = lazy_offload
@@ -156,7 +329,77 @@ class SimpleCPUOffloadScheduler:
             )
         else:
             self._target_free = 0
+        # Lazy mode: never let store pins take the GPU free pool down to
+        # fewer blocks than running requests need to make progress.
+        if self.options.store_reserve_free_blocks is not None:
+            self._store_reserve = self.options.store_reserve_free_blocks
+        else:
+            num_mamba_groups = sum(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                for g in kv_cache_config.kv_cache_groups
+            )
+            self._store_reserve = vllm_config.scheduler_config.max_num_seqs * (
+                1 + num_mamba_groups
+            )
+        # Lazy mode: hashes selected for store whose copy has not completed.
+        self._lazy_inflight_hashes: set[BlockHashWithGroupId] = set()
+        # Lazy mode: the last walk stopped before the end of the free queue
+        # with blocks left to store (keeps an idle engine stepping).
+        self._lazy_backlog = False
+        # Prefix protection (options.protect_hits > 0, lazy mode): see
+        # _count_prefix_hit(). A request hash covers hash_block_size tokens;
+        # a block of group g carries the hashes of _protect_groups[g] of them
+        # and is protected under the last one. Hits are counted for every
+        # _protect_stride-th request hash, the ends of the smallest blocks.
+        self._protect_on = lazy_offload and self.options.protect_hits > 0
+        self._protect_groups: list[tuple[int, int]] = [
+            (gid, group.kv_cache_spec.block_size // hash_block_size)
+            for gid, group in enumerate(self.cpu_kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+        ]
+        self._protect_stride = max(1, gcd(*(span for _, span in self._protect_groups)))
+        self._protect_max_pins = int(
+            self.options.protect_max_fraction * self.num_cpu_blocks
+        )
+        # Request hash -> times of its last protect_hits + 1 hits.
+        self._hit_times: dict[BlockHash, deque[float]] = {}
+        # Protected request hash -> expiry, in expiry order (oldest first).
+        self._protected: dict[BlockHash, float] = {}
+        # CPU blocks held (one extra reference each) for a protected hash,
+        # and CPU block id -> the hash it is held for.
+        self._protect_pins: dict[BlockHash, list[KVCacheBlock]] = {}
+        self._protect_pin_ids: dict[int, BlockHash] = {}
+        # Request id -> tokens it found in the GPU prefix cache, between
+        # get_num_new_matched_tokens() and update_state_after_alloc().
+        self._local_hit_tokens: dict[str, int] = {}
+        # Bytes of one request hash (known from the first counted request).
+        self._hash_len = 0
+        self._next_protect_log = 0.0
+        self._next_hit_prune = 0.0
+        # Granted / expired / given up since the last summary line.
+        self._protect_log_counts = [0, 0, 0]
+        if self._protect_on:
+            logger.info(
+                "SimpleCPU protect enabled: a prefix hit more than %d times "
+                "within %.0f s is kept for %.0f s (refresh_on_hit=%s), at most "
+                "%d of %d CPU blocks; hits counted every %d tokens",
+                self.options.protect_hits,
+                self.options.protect_window_s,
+                self.options.protect_ttl_s,
+                self.options.protect_refresh_on_hit,
+                self._protect_max_pins,
+                self.num_cpu_blocks,
+                self._protect_stride * hash_block_size,
+            )
+
+        # GPU block id -> (hash, allocation generation) of the content it
+        # holds that was already written to (or read from) CPU. An entry only
+        # matches within the residency it was recorded in, even if a later
+        # residency recomputes the same content (same hash).
+        self._gpu_offloaded: dict[int, tuple[BlockHashWithGroupId, int]] = {}
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
+        # GPU blocks pinned by in-flight stores.
+        self._num_store_pinned_blocks = 0
         # Eager mode only
         self._reqs_to_store: dict[str, StoreRequestState] = {}
         self._store_event_to_reqs: dict[int, list[str]] = {}
@@ -170,6 +413,20 @@ class SimpleCPUOffloadScheduler:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
+
+        # Number of build_connector_meta() calls, i.e. scheduler steps.
+        self._num_steps = 0
+        # Step -> GPU block ids of requests that finished in that step (only
+        # the last RECENTLY_FREED_STEPS steps are kept).
+        self._recently_freed: dict[int, set[int]] = {}
+
+        # Diagnostics
+        self._stats = SimpleCPUOffloadStats()
+        self._test_mode = envs.VLLM_SIMPLE_KV_OFFLOAD_TEST_MODE
+        self._clock = time.monotonic
+        self._next_host_mem_check = 0.0
+        self._next_refused_hit_log = 0.0
+        self._num_refused_hits_unlogged = 0
 
     @staticmethod
     def _derive_cpu_config(
@@ -210,6 +467,9 @@ class SimpleCPUOffloadScheduler:
         target = 0
         for g in kv_cache_config.kv_cache_groups:
             spec = g.kv_cache_spec
+            if not spec.prefix_cacheable:
+                # Per-request scratch (e.g. the QSA ring) is never offloaded.
+                continue
             if isinstance(spec, MambaSpec):
                 target += 2
             elif isinstance(spec, SlidingWindowSpec):
@@ -222,6 +482,11 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        gpu_block_pool.quarantine_steps = self.options.freed_block_quarantine_steps
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        """Bind the scheduler's KVCacheManager; see _check_admission()."""
+        self._gpu_kv_cache_manager = kv_cache_manager
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -234,6 +499,16 @@ class SimpleCPUOffloadScheduler:
         # is dropped first.
         if stale := self._pending_cpu_hits.pop(request.request_id, None):
             self._free_pending_cpu_hit(stale)
+        if self._protect_on:
+            self._local_hit_tokens[request.request_id] = num_computed_tokens
+
+        # Requests that bypass the GPU prefix cache (e.g. prompt_logprobs)
+        # must compute every prompt token: no CPU hit either.
+        if request.skip_reading_prefix_cache:
+            return 0, False
+        # Waited too long for GPU pool headroom: prefilled from scratch.
+        if request.request_id in self._cold_fallback_req_ids:
+            return 0, False
 
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped_hashes:]
@@ -250,16 +525,277 @@ class SimpleCPUOffloadScheduler:
         )
 
         if hit_length > 0:
+            reason = self._check_cpu_hit(
+                cpu_hit_blocks, hit_length, num_computed_tokens
+            )
+            if reason is not None:
+                self._refuse_cpu_hit(request.request_id, reason)
+                return 0, False
+            admission, admitted = self._check_admission(
+                request, hit_length, num_computed_tokens
+            )
+            if not admitted:
+                assert admission is not None
+                return self._defer_cpu_hit(request, hit_length, admission)
+            self._deferred_hits.pop(request.request_id, None)
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
             self.cpu_block_pool.touch(pin_blocks)
-            self._pending_cpu_hits[request.request_id] = (
-                cpu_hit_blocks,
-                hit_length,
+            self._pending_cpu_hits[request.request_id] = PendingCPUHit(
+                blocks=cpu_hit_blocks,
+                num_tokens=hit_length,
+                num_local_tokens=num_computed_tokens,
+                need_next=admission[2] if admission is not None else 0,
+                admission=admission,
             )
             return hit_length, True
         return 0, False
+
+    def _check_cpu_hit(
+        self,
+        cpu_hit_blocks: tuple[list["KVCacheBlock"], ...],
+        hit_length: int,
+        num_computed_tokens: int,
+    ) -> str | None:
+        """Return why a CPU hit cannot be loaded as-is, or None if it can.
+
+        Hits are scheduler-block aligned by construction; this guards the
+        load path against a hit that would restore a partial page or a
+        missing / stale Mamba state.
+        """
+        if hit_length % self.block_size != 0:
+            return f"hit_length={hit_length} is not a multiple of {self.block_size}"
+        if (num_computed_tokens + hit_length) % self.block_size != 0:
+            return (
+                f"num_computed_tokens={num_computed_tokens} + hit_length="
+                f"{hit_length} is not a multiple of {self.block_size}"
+            )
+        for g, group in enumerate(self.cpu_kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            blocks = cpu_hit_blocks[g]
+            if not spec.prefix_cacheable:
+                if blocks:
+                    return f"non-cacheable group {g} has {len(blocks)} hit blocks"
+                continue
+            if len(blocks) * spec.block_size != hit_length:
+                return (
+                    f"group {g} has {len(blocks)} hit blocks of "
+                    f"{spec.block_size} tokens for hit_length={hit_length}"
+                )
+            if isinstance(spec, MambaSpec) and blocks[-1].is_null:
+                return f"Mamba group {g} hit does not end with a state block"
+        return None
+
+    def _refuse_cpu_hit(self, req_id: str, reason: str) -> None:
+        self._stats.add(CPU_HITS_REFUSED)
+        if self._test_mode:
+            raise AssertionError(
+                f"SimpleCPUOffloadScheduler: invalid CPU hit for req_id={req_id}: "
+                f"{reason}"
+            )
+        self._num_refused_hits_unlogged += 1
+        now = self._clock()
+        if now < self._next_refused_hit_log:
+            return
+        logger.error(
+            "SimpleCPUOffloadScheduler: refused a CPU hit for req_id=%s (%s); "
+            "%d refused since the last report. The tokens are recomputed.",
+            req_id,
+            reason,
+            self._num_refused_hits_unlogged,
+        )
+        self._num_refused_hits_unlogged = 0
+        self._next_refused_hit_log = now + REFUSED_HIT_LOG_INTERVAL_S
+
+    def _check_admission(
+        self, request: "Request", hit_length: int, num_computed_tokens: int
+    ) -> tuple[tuple[int, int, int, int, int] | None, bool]:
+        """Whether the GPU pool can take the hit and what follows it.
+
+        A hit is allocated in one piece and the request is parked until the
+        load completes. If its first compute step after the load (the rest
+        of the prompt plus lookahead) cannot be allocated then, the request
+        waits holding every loaded block while the running requests, which
+        still need a block now and then, preempt each other: a restore near
+        the pool size ends up slower than a cold prefill. So a hit is admitted
+        only when the pool has room for the hit, for that first step and for a
+        margin covering the running requests' growth during the load; blocks
+        reserved by loads still in flight are not counted as free.
+
+        Returns ``(numbers, admitted)``: ``(free, need_hit, need_next,
+        margin, need_cold)`` as the check saw them (None without a bound
+        manager; need_cold is what a cold start of the request would take
+        now, by the scheduler's own admission gate), and whether the hit can
+        be admitted.
+        """
+        kv_cache_manager = self._gpu_kv_cache_manager
+        if kv_cache_manager is None:
+            return None, True
+        coordinator = kv_cache_manager.coordinator
+        req_id = request.request_id
+        max_model_len = self._max_model_len
+        total_computed = num_computed_tokens + hit_length
+
+        # The GPU prefix hit this CPU hit continues from, as allocate_slots()
+        # will see it. Looked up again because get_computed_blocks() also
+        # records prefix cache statistics.
+        local_blocks, local_len = coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if local_len != num_computed_tokens:
+            if self._test_mode:
+                raise AssertionError(
+                    f"SimpleCPUOffloadScheduler: req_id={req_id} GPU prefix hit "
+                    f"{local_len} != num_computed_tokens {num_computed_tokens}"
+                )
+            logger.debug(
+                "SimpleCPU admission: req=%s GPU prefix hit %d != %d, counting "
+                "the hit without it",
+                req_id,
+                local_len,
+                num_computed_tokens,
+            )
+            local_blocks = tuple([] for _ in coordinator.single_type_managers)
+
+        # The hit itself, exactly as allocate_slots() charges an async load:
+        # no new tokens, and no lookahead with an EAGLE/MTP drafter.
+        lookahead_hit = 0 if self._use_eagle else self._num_lookahead_tokens
+        num_tokens_hit = min(total_computed + lookahead_hit, max_model_len)
+        need_hit = coordinator.get_num_blocks_to_allocate(
+            request_id=req_id,
+            num_tokens=num_tokens_hit,
+            new_computed_blocks=local_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=total_computed,
+            num_tokens_main_model=total_computed,
+        )
+
+        # The first compute step after the load: the next prompt chunk (at
+        # least the last token on a full hit) plus the lookahead.
+        step_tokens = max(request.num_tokens - total_computed, 1)
+        # The scheduler applies long_prefill_token_threshold only while other
+        # requests compete, so a request alone after its load may take the
+        # whole budget: reserve for that.
+        step_tokens = min(step_tokens, self._max_num_batched_tokens)
+        num_tokens_next = min(
+            total_computed + step_tokens + self._num_lookahead_tokens, max_model_len
+        )
+        need_next = 0
+        for group in self.cpu_kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not spec.prefix_cacheable:
+                # Per-request scratch (e.g. the QSA ring): fixed, taken with
+                # the hit.
+                continue
+            if isinstance(spec, MambaSpec):
+                # Align mode: a request that already has blocks takes at most
+                # one more; the other modes cross at most one block boundary.
+                need_next += 1
+            else:
+                need_next += cdiv(num_tokens_next, spec.block_size) - cdiv(
+                    num_tokens_hit, spec.block_size
+                )
+
+        # What a cold start of the request takes now: the full sequence when
+        # the scheduler reserves it up front, else the first chunk.
+        if self._reserve_full_isl:
+            full = min(request.num_tokens, max_model_len)
+            need_cold = coordinator.get_num_blocks_to_allocate(
+                request_id=req_id,
+                num_tokens=full,
+                new_computed_blocks=local_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=num_computed_tokens,
+                num_tokens_main_model=full,
+                apply_admission_cap=True,
+            )
+        else:
+            chunk = min(
+                request.num_tokens - num_computed_tokens, self._max_num_batched_tokens
+            )
+            if 0 < self._long_prefill_token_threshold < chunk:
+                chunk = self._long_prefill_token_threshold
+            need_cold = coordinator.get_num_blocks_to_allocate(
+                request_id=req_id,
+                num_tokens=min(
+                    num_computed_tokens + chunk + self._num_lookahead_tokens,
+                    max_model_len,
+                ),
+                new_computed_blocks=local_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=num_computed_tokens,
+                num_tokens_main_model=num_computed_tokens + chunk,
+            )
+
+        margin = self.options.cpu_hit_admission_margin_blocks
+        if margin is None:
+            margin = self._num_running_last_step
+        reserved = sum(
+            state.need_next
+            for state in self._reqs_to_load.values()
+            if not state.finished
+        )
+        free = kv_cache_manager.block_pool.get_num_free_blocks() - reserved
+        numbers = (free, need_hit, need_next, margin, need_cold)
+        return numbers, free >= need_hit + need_next + margin
+
+    def _defer_cpu_hit(
+        self,
+        request: "Request",
+        hit_length: int,
+        shortfall: tuple[int, int, int, int, int],
+    ) -> tuple[int | None, bool]:
+        """Skip the request this step. After cpu_hit_admission_wait_s the hit
+        is given up as soon as a cold start would be admitted now (giving it
+        up earlier would gain nothing: the request could not start either
+        way), after cpu_hit_admission_max_wait_s regardless."""
+        req_id = request.request_id
+        now = self._clock()
+        since = self._deferred_hits.setdefault(req_id, now)
+        waited = now - since
+        free, need_hit, need_next, margin, need_cold = shortfall
+        self._stats.add(CPU_HITS_DEFERRED)
+        self._stats.add(CPU_HIT_WAIT_S_MAX, waited)
+        options = self.options
+        if waited >= options.cpu_hit_admission_max_wait_s or (
+            waited >= options.cpu_hit_admission_wait_s and free >= need_cold
+        ):
+            del self._deferred_hits[req_id]
+            self._cold_fallback_req_ids.add(req_id)
+            self._stats.add(CPU_HITS_COLD_FALLBACK)
+            logger.info(
+                "SimpleCPU hit req=%s cpu_hit=%d gives up after %.1fs and "
+                "prefills from scratch: GPU pool free=%d (loads in flight "
+                "excluded), hit needs %d, its next step %d, margin %d, a cold "
+                "start needs %d",
+                req_id,
+                hit_length,
+                waited,
+                free,
+                need_hit,
+                need_next,
+                margin,
+                need_cold,
+            )
+            return 0, False
+        if since == now:
+            logger.info(
+                "SimpleCPU hit req=%s cpu_hit=%d deferred: GPU pool free=%d "
+                "(loads in flight excluded), hit needs %d, its next step %d, "
+                "margin %d, a cold start needs %d; retrying for %.0fs, then "
+                "until a cold start fits, at most %.0fs",
+                req_id,
+                hit_length,
+                free,
+                need_hit,
+                need_next,
+                margin,
+                need_cold,
+                options.cpu_hit_admission_wait_s,
+                options.cpu_hit_admission_max_wait_s,
+            )
+        return None, False
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
     # general API should scan blocks in both GPU and CPU block pool in a single pass.
@@ -272,6 +808,13 @@ class SimpleCPUOffloadScheduler:
         req_id = request.request_id
         block_ids_by_group = blocks.get_block_ids()
         num_groups = len(block_ids_by_group)
+
+        if self._protect_on:
+            # Only the call that follows get_num_new_matched_tokens() counts:
+            # a request that waited for a load comes through here again.
+            num_local_tokens = self._local_hit_tokens.pop(req_id, None)
+            if num_local_tokens is not None and request.num_preemptions == 0:
+                self._count_prefix_hit(request, num_local_tokens + num_external_tokens)
 
         # Store tracking (eager mode only). Register the request;
         # block IDs are accumulated from scheduler_output in
@@ -288,6 +831,20 @@ class SimpleCPUOffloadScheduler:
         # between get_num_new_matched_tokens() and this matching call.
         pending = self._pending_cpu_hits.pop(req_id, None)
 
+        directives: Directives | None = None
+        if self.options.allow_request_directives:
+            try:
+                directives = parse_directives(request.kv_transfer_params)
+            except ValueError as err:
+                logger.warning("SimpleCPU directives req=%s rejected: %s", req_id, err)
+            if directives is not None and directives.controls:
+                self._pending_controls.update(directives.controls)
+                logger.warning(
+                    "SimpleCPU directives req=%s controls=%s",
+                    req_id,
+                    dict(directives.controls),
+                )
+
         if num_external_tokens == 0:
             if pending is not None:
                 logger.warning(
@@ -300,71 +857,74 @@ class SimpleCPUOffloadScheduler:
                 self._free_pending_cpu_hit(pending)
             return
 
-        if pending is None:
-            logger.warning(
-                "SimpleCPUOffloadScheduler: update_state_after_alloc called "
-                "for req_id=%s with num_external_tokens=%d but no pending "
-                "CPU hit from get_num_new_matched_tokens(); skipping load.",
-                req_id,
-                num_external_tokens,
+        # The scheduler admits exactly the external tokens reported by
+        # get_num_new_matched_tokens() (it never trims them) and parks the
+        # request in WAITING_FOR_REMOTE_KVS until the load completes, so
+        # anything else would either load a partial hit or never finish.
+        if pending is None or num_external_tokens != pending.num_tokens:
+            if pending is not None:
+                self._free_pending_cpu_hit(pending)
+            raise RuntimeError(
+                f"SimpleCPUOffloadScheduler: update_state_after_alloc for "
+                f"req_id={req_id} got num_external_tokens={num_external_tokens}"
+                f" but get_num_new_matched_tokens() reported "
+                f"{pending.num_tokens if pending is not None else 0}"
             )
-            return
 
-        cpu_hit_blocks_full, _ = pending
-
-        # ``num_external_tokens`` is LCM-aligned (checked per-group below),
-        # so this counts whole scheduler-aligned chunks of incoming tokens.
-        num_blocks_to_load = num_external_tokens // self.block_size
-        assert num_blocks_to_load > 0
-        num_cached_fa_blocks = sum(
-            blk.block_hash is not None for blk in blocks.blocks[self.fa_gidx]
-        )
-        num_computed_tokens = num_cached_fa_blocks * self.fa_block_size
-
-        # Build transfer pairs across all groups.
-        total_computed_tokens = num_computed_tokens + num_external_tokens
+        # Build transfer pairs across all groups. External blocks sit at the
+        # tail of the computed range of every group.
+        total_computed_tokens = pending.num_local_tokens + num_external_tokens
         kv_cache_groups = self.cpu_kv_cache_config.kv_cache_groups
-
-        # The scheduler may have accepted fewer blocks than
-        # get_num_new_matched_tokens() reported.
-        # (e.g. due to token budget in test_partial_gpu_prefix_plus_cpu_load).
-        # Take only the leading N blocks per group matching num_external_tokens;
-        # the rest will be released along with the temp pin below.
-        cpu_hit_blocks: list[list[KVCacheBlock]] = []
-        for g in range(num_groups):
-            g_block_size = kv_cache_groups[g].kv_cache_spec.block_size
-            assert num_external_tokens % g_block_size == 0, (
-                f"num_external_tokens={num_external_tokens} not aligned to "
-                f"group {g} block_size={g_block_size}"
-            )
-            n_take_g = num_external_tokens // g_block_size
-            cpu_hit_blocks.append(cpu_hit_blocks_full[g][:n_take_g])
+        assert self._gpu_block_pool is not None
+        gpu_blocks = self._gpu_block_pool.blocks
 
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
+        block_kinds: list[int] = []
         cpu_blocks_to_touch: list[KVCacheBlock] = []
 
         for g in range(num_groups):
-            cpu_blocks_g = cpu_hit_blocks[g]
-            n_ext_g = len(cpu_blocks_g)
-            if n_ext_g == 0:
+            spec = kv_cache_groups[g].kv_cache_spec
+            block_kind = g  # the owner's KV cache group (fingerprint block kind)
+            if not spec.prefix_cacheable:
+                # Per-request scratch; get_num_new_matched_tokens() refuses
+                # hits with blocks in these groups.
                 continue
-
+            cpu_blocks_g = pending.blocks[g]
             # Number of blocks in the computed range for this group.
-            g_block_size = kv_cache_groups[g].kv_cache_spec.block_size
-            n_computed_g = cdiv(total_computed_tokens, g_block_size)
-
-            # Back-trace: ext blocks sit at the tail of the computed range.
-            gpu_ext_start = n_computed_g - n_ext_g
+            n_computed_g = cdiv(total_computed_tokens, spec.block_size)
+            gpu_ext_start = n_computed_g - len(cpu_blocks_g)
             group_gpu_ids = block_ids_by_group[g]
 
             for i, cpu_blk in enumerate(cpu_blocks_g):
                 # Skip null blocks (e.g. sliding window or mamba padding).
                 if cpu_blk.is_null:
                     continue
-                gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
+                gpu_block_id = group_gpu_ids[gpu_ext_start + i]
+                if gpu_blocks[gpu_block_id].is_null:
+                    raise RuntimeError(
+                        f"SimpleCPUOffloadScheduler: req_id={req_id} group {g} "
+                        f"would load CPU block {cpu_blk.block_id} into the "
+                        "null GPU block"
+                    )
+                gpu_block_ids.append(gpu_block_id)
                 cpu_block_ids.append(cpu_blk.block_id)
+                block_kinds.append(block_kind)
                 cpu_blocks_to_touch.append(cpu_blk)
+
+            if isinstance(spec, MambaSpec) and (
+                not cpu_blocks_g
+                or cpu_blocks_g[-1].is_null
+                or gpu_block_ids[-1] != group_gpu_ids[n_computed_g - 1]
+            ):
+                # The request resumes from the state in its last computed
+                # block; anything else restores a stale or missing state.
+                raise RuntimeError(
+                    f"SimpleCPUOffloadScheduler: req_id={req_id} Mamba group "
+                    f"{g} load does not end in the state block "
+                    f"{group_gpu_ids[n_computed_g - 1]} for "
+                    f"{total_computed_tokens} computed tokens"
+                )
 
         # Touch CPU blocks to prevent eviction during async load.
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
@@ -372,29 +932,105 @@ class SimpleCPUOffloadScheduler:
         self._free_pending_cpu_hit(pending)
 
         # Touch GPU blocks to prevent freeing during async load
-        assert self._gpu_block_pool is not None
-        self._gpu_block_pool.touch(
-            [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+        self._gpu_block_pool.touch([gpu_blocks[bid] for bid in gpu_block_ids])
+
+        # The loaded content is already on CPU: do not store it back.
+        for gpu_block_id, cpu_blk in zip(gpu_block_ids, cpu_blocks_to_touch):
+            assert cpu_blk.block_hash is not None
+            self._gpu_offloaded[gpu_block_id] = (
+                cpu_blk.block_hash,
+                gpu_blocks[gpu_block_id].alloc_generation,
+            )
+
+        self._stats.add(LOAD_REQUESTS)
+        if self._recently_freed:
+            num_recently_freed = sum(
+                any(bid in freed for freed in self._recently_freed.values())
+                for bid in gpu_block_ids
+            )
+            if num_recently_freed:
+                self._stats.add(LOAD_DST_RECENTLY_FREED, num_recently_freed)
+        # Same count from the pool's free stamps: covers preemption and
+        # skipped-block frees too.
+        oldest = self._num_steps - RECENTLY_FREED_STEPS
+        num_young = sum(
+            gpu_blocks[bid].freed_at_step >= oldest for bid in gpu_block_ids
         )
+        if num_young:
+            self._stats.add(LOAD_DST_YOUNG, num_young)
+        if self.options.log_transfer_blocks:
+            logger.info(
+                "SimpleCPU load blocks req=%s step=%d gpu=%s cpu=%s",
+                req_id,
+                self._num_steps,
+                _ranges(gpu_block_ids),
+                _ranges(cpu_block_ids),
+            )
+            # The request's whole block rows, in order, per KV cache group
+            # (0 = null block): which entries were loaded and which are fresh.
+            logger.info(
+                "SimpleCPU load rows req=%s computed=%d %s",
+                req_id,
+                total_computed_tokens,
+                " ".join(
+                    f"g{g}[{len(ids)}]={','.join(map(str, ids[-12:]))}"
+                    for g, ids in enumerate(block_ids_by_group)
+                ),
+            )
+
+        if self._protect_pin_ids:
+            num_protected = sum(cid in self._protect_pin_ids for cid in cpu_block_ids)
+            if num_protected:
+                self._stats.add(LOAD_PROTECTED_BLOCKS, num_protected)
+                logger.info(
+                    "SimpleCPU protect: load req=%s takes %d of %d blocks from "
+                    "protected copies",
+                    req_id,
+                    num_protected,
+                    len(cpu_block_ids),
+                )
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
-            request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
+            request=request,
+            transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids),
+            num_local_hit_tokens=pending.num_local_tokens,
+            num_cpu_hit_tokens=num_external_tokens,
+            need_next=pending.need_next,
+            admission=pending.admission,
+            kinds=block_kinds,
+            directives=directives,
         )
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
+        self._maybe_check_host_mem()
+        if self._protect_on:
+            self._protect_tick()
+        self._num_running_last_step = len(scheduler_output.num_scheduled_tokens)
+        if self._gpu_block_pool is not None:
+            self._gpu_block_pool.current_step = self._num_steps
+
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
+            if self.options.log_transfer_blocks:
+                logger.info(
+                    "SimpleCPU store blocks event=%d step=%d pairs=%s",
+                    store_event,
+                    self._num_steps,
+                    list(zip(store_gpu, store_cpu)),
+                )
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu, store_cpu
             )
+            self._num_store_pinned_blocks += len(store_gpu)
+            self._stats.add(STORES_SELECTED, len(store_gpu))
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -406,100 +1042,268 @@ class SimpleCPUOffloadScheduler:
         load_event = -1
         load_gpu: list[int] = []
         load_cpu: list[int] = []
+        load_kinds: list[int] = []
+        load_spans: list[tuple[int, int]] = []
+        load_corrupt: list[tuple[int, int, str]] = []
+        load_gate = False
         load_req_ids: list[str] = []
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
             assert load_state.transfer_meta is not None
+            start = len(load_gpu)
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
+            load_kinds.extend(load_state.kinds)
+            load_spans.append((start, len(load_gpu)))
+            directives = load_state.directives
+            if directives is not None:
+                if directives.corrupt:
+                    load_corrupt.append((start, len(load_gpu), directives.corrupt))
+                load_gate = load_gate or directives.gate
             load_req_ids.append(req_id)
         if load_req_ids:
             load_event = self._load_event_counter
             self._load_event_counter += 1
+            if len(load_kinds) != len(load_gpu):
+                load_kinds = []
+            self._load_spans[load_event] = load_spans
+            if load_corrupt:
+                self._load_corrupt[load_event] = load_corrupt
+            if load_gate:
+                self._load_gate[load_event] = True
+            if load_corrupt or load_gate:
+                logger.warning(
+                    "SimpleCPU load directives event=%d corrupt=%s gate=%s",
+                    load_event,
+                    load_corrupt,
+                    load_gate,
+                )
+            now = self._clock()
             for req_id in load_req_ids:
-                self._reqs_to_load[req_id].load_event = load_event
+                load_state = self._reqs_to_load[req_id]
+                load_state.load_event = load_event
+                load_state.emit_step = self._num_steps
+                load_state.emit_time = now
+                admission = load_state.admission
+                logger.info(
+                    "SimpleCPU load req=%s local_hit=%d cpu_hit=%d blocks=%d "
+                    "event=%d pool_free=%s need_hit=%s need_next=%s margin=%s "
+                    "need_cold=%s",
+                    req_id,
+                    load_state.num_local_hit_tokens,
+                    load_state.num_cpu_hit_tokens,
+                    len(load_state.transfer_meta.gpu_block_ids),
+                    load_event,
+                    *(admission if admission is not None else ("-",) * 5),
+                )
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        controls = self._pending_controls
+        self._pending_controls = {}
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
             load_event_to_reqs=self._load_event_to_reqs,
+            load_block_kinds=load_kinds if self.options.fingerprint else [],
+            load_spans=self._load_spans,
+            load_corrupt=self._load_corrupt,
+            load_gate=self._load_gate,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
+            store_block_kinds=(
+                [self._block_kind(bid) for bid in store_gpu]
+                if self.options.fingerprint
+                else []
+            ),
             need_flush=bool(scheduler_output.preempted_req_ids),
+            num_cpu_blocks=self.num_cpu_blocks,
+            controls=controls,
         )
+
+        self._num_steps += 1
+        oldest_step = self._num_steps - RECENTLY_FREED_STEPS + 1
+        for step in [s for s in self._recently_freed if s < oldest_step]:
+            del self._recently_freed[step]
         return result
+
+    def _block_kind(self, gpu_block_id: int) -> int:
+        """A hashed GPU block's kind for the fingerprint chain: the KV cache
+        group of its hash, BLOCK_UNKNOWN without a hash."""
+        assert self._gpu_block_pool is not None
+        bhash = self._gpu_block_pool.blocks[gpu_block_id].block_hash
+        if bhash is None:
+            return BLOCK_UNKNOWN
+        return get_group_id(bhash)
+
+    def _maybe_check_host_mem(self) -> None:
+        """Sample host MemAvailable every HOST_MEM_CHECK_INTERVAL_S seconds."""
+        now = self._clock()
+        if now < self._next_host_mem_check:
+            return
+        self._next_host_mem_check = now + HOST_MEM_CHECK_INTERVAL_S
+        available = read_mem_available_bytes()
+        if available is None:
+            return
+        available_gib = available / GiB
+        self._stats.add(HOST_MEM_AVAILABLE_GIB_MIN, available_gib)
+        if available_gib < self.options.host_mem_warn_gib:
+            logger.warning(
+                "SimpleCPUOffloadScheduler: host MemAvailable is %.2f GiB, below "
+                "host_mem_warn_gib=%.2f; the pinned CPU KV tier cannot be "
+                "reclaimed.",
+                available_gib,
+                self.options.host_mem_warn_gib,
+            )
 
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
         """Prepare store specs for the store event."""
         if self._lazy_mode:
-            return self._prepare_lazy_store_specs()
+            return self._prepare_lazy_store_specs(scheduler_output)
         else:
             return self._prepare_eager_store_specs(scheduler_output)
 
     def _prepare_lazy_store_specs(
-        self,
+        self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
-        """Single-pass cursor walk: offload cached GPU blocks near eviction.
+        """Paced cursor walk over the GPU free queue.
 
-        Walks the GPU free queue from the cursor, counting blocks that are
-        free-or-offloaded (safe for the allocator to evict). Stops when
-        target_free blocks are covered or CPU capacity is reached.
+        Freed hashed blocks are appended at the MRU tail of the GPU free queue.
+        The cursor follows the tail, so blocks are copied to CPU a few steps
+        after their request released them and stay valid on GPU until the
+        allocator evicts them (inclusive tier).
+
+        Each step visits at most max(target_free, 4 * max_store_blocks_per_step)
+        nodes and selects at most max_store_blocks_per_step blocks
+        (IDLE_STORE_MULTIPLIER times that on steps without scheduled tokens).
+        Selection stops at the first candidate that would take the GPU free
+        pool down to the reserve, find no allocatable CPU block, or pin more
+        than 4 * max_store_blocks_per_step GPU blocks in in-flight stores; the
+        cursor stays in front of that candidate.
         """
         gpu_pool = self._gpu_block_pool
         if gpu_pool is None or self._target_free <= 0:
+            self._lazy_backlog = False
             return [], [], []
 
         free_queue = gpu_pool.free_block_queue
         if not isinstance(free_queue, FreeKVCacheBlockQueue):
             # Partitioned state/history pools have one eviction order per
-            # range; the cursor walk covers a single queue only.
+            # range; the lazy walk follows a single free queue only
+            # (1CatAI 41fa4bee9).
             return [], [], []
-        cpu_pool = self.cpu_block_pool
-        num_cpu_free = cpu_pool.get_num_free_blocks()
-
-        # Validate cursor: stale if block was removed from free queue.
-        if self._cursor is not None and self._cursor.ref_cnt > 0:
-            self._cursor = None
-
-        # Determine start node.
-        if self._cursor is None:
-            node = free_queue.fake_free_list_head.next_free_block
-        else:
-            node = self._cursor.next_free_block
-
         tail = free_queue.fake_free_list_tail
-        gpu_ids: list[int] = []
-        block_hashes: list[bytes] = []
-        covered = 0
-        last_visited = self._cursor
+        cpu_pool = self.cpu_block_pool
+        cpu_cached = cpu_pool.cached_block_hash_to_block
+        stats = self._stats
 
-        while (
-            node is not None
-            and node is not tail
-            and covered < self._target_free
-            and len(gpu_ids) < num_cpu_free
+        max_per_step = self.options.max_store_blocks_per_step
+        visit_budget = max(self._target_free, 4 * max_per_step)
+        is_idle = scheduler_output.total_num_scheduled_tokens == 0
+        max_select = max_per_step * (IDLE_STORE_MULTIPLIER if is_idle else 1)
+        max_select = min(
+            max_select,
+            cpu_pool.get_num_free_blocks(),
+            4 * max_per_step - self._num_store_pinned_blocks,
+        )
+        num_gpu_free = gpu_pool.get_num_free_blocks()
+        quarantine_steps = self.options.freed_block_quarantine_steps
+        # Re-storing a block whose CPU copy was evicted is opt-in, and never
+        # done on idle steps so the idle drain always ends.
+        skip_restore = not self.options.allow_restore or is_idle
+
+        # Resume after the cursor while it is still a free block; a cursor
+        # that was allocated (or touched by a prefix hit) restarts the walk
+        # at the LRU head. Frees reach the pool before the next schedule()
+        # allocates, so a cursor taken in this step is still taken here.
+        cursor = self._cursor
+        node: KVCacheBlock | None
+        if (
+            cursor is not None
+            and cursor.ref_cnt == 0
+            and cursor.prev_free_block is not None
+            and cursor.next_free_block is not None
         ):
-            last_visited = node
-            bhash = node.block_hash
+            node = cursor.next_free_block
+        else:
+            cursor = None
+            node = free_queue.fake_free_list_head.next_free_block
 
-            if (
-                bhash is not None
-                and not node.is_null
-                and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
+        gpu_ids: list[int] = []
+        block_hashes: list[BlockHashWithGroupId] = []
+        num_visited = 0
+        blocked = False
+        quarantined = False
+        while node is not None and node is not tail and num_visited < visit_budget:
+            bhash = node.block_hash
+            if bhash is None or node.is_null:
+                pass
+            elif cpu_cached.get_one_block(bhash) is not None:
+                # Already on CPU. Visiting a free GPU block says nothing about
+                # its use, so CPU recency is left alone: request_finished()
+                # refreshes what requests actually used.
+                pass
+            elif bhash in self._lazy_inflight_hashes:
+                stats.add(INFLIGHT_SKIPPED)
+            elif (
+                skip_restore
+                and self._gpu_offloaded.get(node.block_id)
+                == (bhash, node.alloc_generation)
+                # A protected prefix whose CPU copy was evicted before it
+                # became protected is stored again (busy steps only, like
+                # allow_restore): its new copy is held, so this ends.
+                and (is_idle or not self._is_protected(bhash))
             ):
+                stats.add(RESTORE_SKIPPED)
+            else:
+                # Candidate. Stop in front of it if it cannot be selected.
+                if (
+                    quarantine_steps > 0
+                    and node.freed_at_step > self._num_steps - quarantine_steps
+                ):
+                    # Freed too recently: a step that was in flight when it
+                    # was freed may still touch it. The cursor stays in front
+                    # of it and the engine keeps stepping until it has aged.
+                    stats.add(QUARANTINE_SKIPPED)
+                    quarantined = True
+                    blocked = True
+                    break
+                if len(gpu_ids) >= max_select:
+                    blocked = True
+                    break
+                if num_gpu_free - len(gpu_ids) <= self._store_reserve:
+                    stats.add(RESERVE_STOPS)
+                    blocked = True
+                    break
                 gpu_ids.append(node.block_id)
                 block_hashes.append(bhash)
-
-            covered += 1
+                self._lazy_inflight_hashes.add(bhash)
+                self._gpu_offloaded[node.block_id] = (bhash, node.alloc_generation)
+                num_visited += 1
+                node = node.next_free_block
+                continue
+            # Selected nodes leave the free queue when touched below, so the
+            # cursor is the last visited node that stays.
+            cursor = node
+            num_visited += 1
             node = node.next_free_block
 
-        self._cursor = last_visited
+        self._cursor = cursor
+        if node is None or node is tail:
+            self._lazy_backlog = False
+        elif blocked:
+            # Progress next step needs this step's stores or earlier ones to
+            # complete; with neither in flight nothing would change.
+            self._lazy_backlog = (
+                quarantined or bool(gpu_ids) or bool(self._store_event_to_blocks)
+            )
+        else:
+            # Visit budget exhausted.
+            self._lazy_backlog = True
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
@@ -664,14 +1468,34 @@ class SimpleCPUOffloadScheduler:
         per-event worker counts. We accumulate across steps and process
         a store event only when all workers have reported completion.
         """
+        # --- Failed loads (gated loads with a bad fingerprint verdict) ---
+        # The scheduler recomputes the affected requests from their GPU
+        # prefix; here the bad CPU copies leave the CPU prefix cache and the
+        # GPU blocks forget that they were offloaded, so the recomputed
+        # blocks can be stored again.
+        invalid = connector_output.invalid_block_ids
+        if invalid:
+            self._fail_loads(invalid)
+
         # --- Load completions ---
         for req_id in list(connector_output.finished_recving or []):
+            load_state = self._reqs_to_load.get(req_id)
+            if load_state is not None and load_state.load_event is not None:
+                logger.info(
+                    "SimpleCPU load done req=%s event=%d steps=%d wall_ms=%.1f",
+                    req_id,
+                    load_state.load_event,
+                    self._num_steps - load_state.emit_step,
+                    (self._clock() - load_state.emit_time) * 1000,
+                )
             self._cleanup_load_request(req_id)
 
         # --- Store completions ---
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
             return
+        if meta.bad_cpu_blocks:
+            self._quarantine(meta.bad_cpu_blocks)
         for event_idx, count in meta.completed_store_events.items():
             total = self._store_event_pending_counts.get(event_idx, 0) + count
             if total >= self._expected_worker_count:
@@ -680,9 +1504,60 @@ class SimpleCPUOffloadScheduler:
             else:
                 self._store_event_pending_counts[event_idx] = total
 
+    def _fail_loads(self, invalid_gpu_block_ids: set[int]) -> None:
+        """GPU blocks of in-flight loads that the worker reported as failed
+        (metadata.load_gate): evict their CPU copies from the CPU prefix
+        cache and drop the offloaded mark of every GPU block of the affected
+        requests."""
+        for req_id, state in self._reqs_to_load.items():
+            meta = state.transfer_meta
+            bad = [
+                (gid, cid)
+                for gid, cid in zip(meta.gpu_block_ids, meta.cpu_block_ids)
+                if gid in invalid_gpu_block_ids
+            ]
+            if not bad:
+                continue
+            self.cpu_block_pool.evict_blocks({cid for _, cid in bad})
+            self._protect_drop_blocks([cid for _, cid in bad])
+            for gid in meta.gpu_block_ids:
+                self._gpu_offloaded.pop(gid, None)
+            self._stats.add(LOAD_FAILED_REQUESTS)
+            self._stats.add(LOAD_FAILED_BLOCKS, len(bad))
+            logger.warning(
+                "SimpleCPU load FAILED req=%s event=%s: %d of %d blocks bad; "
+                "CPU blocks %s evicted from the tier, the request recomputes "
+                "from its GPU prefix (%d tokens)",
+                req_id,
+                state.load_event,
+                len(bad),
+                len(meta.gpu_block_ids),
+                _ranges([cid for _, cid in bad]),
+                state.num_local_hit_tokens,
+            )
+
+    def _quarantine(self, cpu_block_ids: list[int]) -> None:
+        """Keep CPU blocks that delivered bad content out of circulation: an
+        extra reference keeps them off the free queue for good."""
+        new = [bid for bid in cpu_block_ids if bid not in self._quarantined]
+        if not new:
+            return
+        blocks = [self.cpu_block_pool.blocks[bid] for bid in new]
+        self.cpu_block_pool.evict_blocks(set(new))
+        self._protect_drop_blocks(new)
+        self.cpu_block_pool.touch(blocks)
+        self._quarantined.update(new)
+        self._stats.add(CPU_BLOCKS_QUARANTINED, len(new))
+        logger.warning(
+            "SimpleCPU quarantine: CPU blocks %s are never used again (%d in all)",
+            _ranges(new),
+            len(self._quarantined),
+        )
+
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx)
+        self._num_store_pinned_blocks -= len(transfer.gpu_block_ids)
         if not self._lazy_mode:
             self._in_flight_store_gpu_blocks.difference_update(transfer.gpu_block_ids)
         self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
@@ -719,9 +1594,12 @@ class SimpleCPUOffloadScheduler:
             bhash = cpu_block.block_hash
             assert bhash is not None
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
+            self._lazy_inflight_hashes.discard(bhash)
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
+        if self._protected and self._protect_pin_blocks(cpu_blocks):
+            self._protect_enforce_budget()
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
@@ -731,6 +1609,258 @@ class SimpleCPUOffloadScheduler:
         """Return True if there are in-flight store transfers."""
         return bool(self._store_event_to_blocks)
 
+    def has_pending_work(self) -> bool:
+        """Return True while the engine must keep stepping without requests:
+        stores are in flight, or the lazy walk has freed blocks left to store.
+        """
+        return bool(self._store_event_to_blocks) or (
+            self._lazy_mode and self._lazy_backlog
+        )
+
+    def reset(self) -> bool:
+        """Drop the CPU prefix cache. Returns False while transfers are in
+        flight (the caller retries later)."""
+        if (
+            self._reqs_to_load
+            or self._load_event_to_reqs
+            or self._store_event_to_blocks
+        ):
+            return False
+        for pending in self._pending_cpu_hits.values():
+            self._free_pending_cpu_hit(pending)
+        self._pending_cpu_hits.clear()
+        self._deferred_hits.clear()
+        self._cold_fallback_req_ids.clear()
+        self._protect_clear()
+        self._cursor = None
+        self._gpu_offloaded.clear()
+        self._lazy_inflight_hashes.clear()
+        self._lazy_backlog = False
+        return self.cpu_block_pool.reset_prefix_cache()
+
+    def get_stats(self) -> SimpleCPUOffloadStats | None:
+        """Scheduler-side counters since the last call plus current gauges."""
+        stats = self._stats
+        stats.add(STORE_PINS_LAST, self._num_store_pinned_blocks)
+        if (
+            self._gpu_block_pool is not None
+            and self.options.freed_block_quarantine_steps
+        ):
+            stats.add(
+                QUARANTINE_FALLBACKS_LAST, self._gpu_block_pool.quarantine_fallbacks
+            )
+        stats.add(
+            CPU_USED_BLOCKS_LAST,
+            self.num_cpu_blocks - self.cpu_block_pool.get_num_free_blocks(),
+        )
+        stats.add(
+            CPU_CACHED_BLOCKS_LAST,
+            len(self.cpu_block_pool.cached_block_hash_to_block),
+        )
+        if self._protect_on:
+            stats.add(PROTECTED_HASHES_LAST, len(self._protected))
+            stats.add(PROTECTED_CPU_BLOCKS_LAST, len(self._protect_pin_ids))
+        if stats.is_empty():
+            stats.reset()
+            return None
+        return stats.clone_and_reset()
+
+    # ------------------------------------------------------------------
+    # Prefix protection
+    # ------------------------------------------------------------------
+    def _count_prefix_hit(self, request: "Request", num_hit_tokens: int) -> None:
+        """Count one hit on every block of the prefix a newly scheduled
+        request found cached (GPU prefix cache plus CPU tier), and protect
+        the blocks that were hit more than protect_hits times within
+        protect_window_s seconds.
+
+        A hit on a block is a hit on all blocks before it, so the protected
+        hashes of a prompt always form a prefix of it. The CPU copies of a
+        protected hash are held with an extra reference (see
+        _protect_pin_blocks) until its protection expires.
+        """
+        if num_hit_tokens <= 0:
+            return
+        if self._use_eagle:
+            # With EAGLE/MTP a hit stops one block short of what the caches
+            # hold (the last matched block is recomputed), so that block is
+            # part of what served the hit and must survive with it. Where it
+            # is not shared, it never reaches the hit rate.
+            num_hit_tokens += self.block_size
+        hashes = request.block_hashes
+        stride = self._protect_stride
+        num_hashes = min(num_hit_tokens // self.hash_block_size, len(hashes))
+        num_hashes -= num_hashes % stride
+        if num_hashes <= 0:
+            return
+        if not self._hash_len:
+            self._hash_len = len(hashes[0])
+        opts = self.options
+        now = self._clock()
+        self._protect_expire(now)
+        need = opts.protect_hits + 1
+        expiry = now + opts.protect_ttl_s
+        granted = 0
+        # Deepest block first: the prefix head ends up last in the expiry
+        # order, so it expires and is given up for the budget last.
+        for idx in range(num_hashes - 1, -1, -stride):
+            key = hashes[idx]
+            times = self._hit_times.get(key)
+            if times is None:
+                times = self._hit_times[key] = deque(maxlen=need)
+            times.append(now)
+            known = key in self._protected
+            hot = len(times) == need and now - times[0] <= opts.protect_window_s
+            if not hot and not (known and opts.protect_refresh_on_hit):
+                continue
+            if known:
+                del self._protected[key]
+            self._protected[key] = expiry
+            if not known:
+                granted += 1
+                self._protect_pin_existing(hashes, idx)
+        if granted:
+            self._stats.add(PROTECT_GRANTED, granted)
+            self._protect_log_counts[0] += granted
+            self._protect_enforce_budget()
+
+    def _protect_key(self, bhash: "BlockHashWithGroupId") -> BlockHash | None:
+        """The request hash a cached block is protected under: the hash of
+        the last hash block it spans."""
+        if not self._hash_len:
+            return None
+        return BlockHash(get_block_hash(bhash)[-self._hash_len :])
+
+    def _is_protected(self, bhash: "BlockHashWithGroupId") -> bool:
+        if not self._protected:
+            return False
+        key = self._protect_key(bhash)
+        return key is not None and self._protected.get(key, 0.0) > self._clock()
+
+    def _protect_pin_existing(self, hashes: Sequence[BlockHash], idx: int) -> None:
+        """Hold the CPU copies (one per group whose block ends at request
+        hash idx) that a newly protected hash already has."""
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        found = []
+        for group_id, span in self._protect_groups:
+            if (idx + 1) % span:
+                continue
+            block_hash = BlockHash(b"".join(hashes[idx + 1 - span : idx + 1]))
+            block = cached.get_one_block(
+                make_block_hash_with_group_id(block_hash, group_id)
+            )
+            if block is not None:
+                found.append(block)
+        self._protect_pin_blocks(found)
+
+    def _protect_pin_blocks(self, blocks: Sequence["KVCacheBlock"]) -> int:
+        """Take an extra reference on the cached CPU blocks whose hash is
+        protected, which keeps them off the free queue: the allocator cannot
+        evict them, loads still find them. Returns how many were taken."""
+        now = self._clock()
+        num_pinned = 0
+        for block in blocks:
+            bhash = block.block_hash
+            if (
+                bhash is None
+                or block.is_null
+                or block.block_id in self._protect_pin_ids
+                or block.block_id in self._quarantined
+            ):
+                continue
+            key = self._protect_key(bhash)
+            if key is None or self._protected.get(key, 0.0) <= now:
+                continue
+            self.cpu_block_pool.touch([block])
+            self._protect_pins.setdefault(key, []).append(block)
+            self._protect_pin_ids[block.block_id] = key
+            num_pinned += 1
+        return num_pinned
+
+    def _unprotect(self, key: BlockHash) -> None:
+        """End the protection of a hash: its CPU copies return to the MRU
+        end of the LRU as ordinary cached blocks."""
+        self._protected.pop(key, None)
+        blocks = self._protect_pins.pop(key, None)
+        if blocks:
+            for block in blocks:
+                del self._protect_pin_ids[block.block_id]
+            self.cpu_block_pool.free_blocks(blocks)
+
+    def _protect_enforce_budget(self) -> None:
+        """Give up the protections that would expire first while more than
+        protect_max_fraction of the CPU blocks are held."""
+        capped = 0
+        while self._protected and len(self._protect_pin_ids) > self._protect_max_pins:
+            self._unprotect(next(iter(self._protected)))
+            capped += 1
+        if capped:
+            self._stats.add(PROTECT_CAPPED, capped)
+            self._protect_log_counts[2] += capped
+
+    def _protect_expire(self, now: float) -> None:
+        expired = 0
+        while self._protected:
+            key = next(iter(self._protected))
+            if self._protected[key] > now:
+                break
+            self._unprotect(key)
+            expired += 1
+        if expired:
+            self._stats.add(PROTECT_EXPIRED, expired)
+            self._protect_log_counts[1] += expired
+
+    def _protect_drop_blocks(self, cpu_block_ids: Iterable[int]) -> None:
+        """Release the hold on CPU blocks that leave the prefix cache for
+        another reason (a failed gated load, quarantine)."""
+        for block_id in cpu_block_ids:
+            key = self._protect_pin_ids.pop(block_id, None)
+            if key is None:
+                continue
+            block = self.cpu_block_pool.blocks[block_id]
+            held = self._protect_pins[key]
+            held.remove(block)
+            if not held:
+                del self._protect_pins[key]
+            self.cpu_block_pool.free_blocks([block])
+
+    def _protect_clear(self) -> None:
+        """Forget every protection and hit count (prefix cache reset)."""
+        for blocks in self._protect_pins.values():
+            self.cpu_block_pool.free_blocks(blocks)
+        self._protect_pins.clear()
+        self._protect_pin_ids.clear()
+        self._protected.clear()
+        self._hit_times.clear()
+
+    def _protect_tick(self) -> None:
+        """Once per step: expire protections, forget hit histories that
+        can no longer reach the hit rate, and log a summary of changes."""
+        now = self._clock()
+        self._protect_expire(now)
+        if now >= self._next_hit_prune:
+            self._next_hit_prune = now + PROTECT_PRUNE_INTERVAL_S
+            oldest = now - self.options.protect_window_s
+            stale = [k for k, times in self._hit_times.items() if times[-1] < oldest]
+            for key in stale:
+                del self._hit_times[key]
+        if any(self._protect_log_counts) and now >= self._next_protect_log:
+            self._next_protect_log = now + PROTECT_LOG_INTERVAL_S
+            granted, expired, capped = self._protect_log_counts
+            self._protect_log_counts = [0, 0, 0]
+            logger.info(
+                "SimpleCPU protect: +%d protected, %d expired, %d given up for "
+                "the budget; now %d block hashes protected, %d of %d CPU blocks "
+                "held (budget %d)",
+                granted,
+                expired,
+                capped,
+                len(self._protected),
+                len(self._protect_pin_ids),
+                self.num_cpu_blocks,
+                self._protect_max_pins,
+            )
+
     def request_finished(
         self,
         request: "Request",
@@ -738,13 +1868,59 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
         so the scheduler can free blocks immediately."""
+        self._refresh_cpu_recency((block_ids,))
+        return self._request_finished(request, block_ids)
+
+    def _refresh_cpu_recency(self, block_ids_by_group: tuple[list[int], ...]) -> None:
+        """Move the CPU copies of a finishing request's blocks to the MRU end
+        of the CPU LRU, prefix head last so it is evicted last.
+
+        CPU recency follows use, like the GPU prefix cache: without this a
+        conversation restored from CPU and used again would keep its old
+        position and be evicted before blocks that merely sat in the GPU
+        free queue. Runs before the scheduler frees the request's GPU blocks,
+        so their hashes are still set.
+        """
+        if not self._lazy_mode or self._gpu_block_pool is None:
+            return
+        gpu_blocks = self._gpu_block_pool.blocks
+        cpu_cached = self.cpu_block_pool.cached_block_hash_to_block
+        refresh: list[KVCacheBlock] = []
+        # Later groups first and each group tail first: the first group's
+        # (full attention) head ends up most recent.
+        for group_ids in reversed(block_ids_by_group):
+            for block_id in reversed(group_ids):
+                block = gpu_blocks[block_id]
+                bhash = block.block_hash
+                if block.is_null or bhash is None:
+                    continue
+                cpu_blk = cpu_cached.get_one_block(bhash)
+                if cpu_blk is not None and cpu_blk.ref_cnt == 0:
+                    refresh.append(cpu_blk)
+        if refresh:
+            self.cpu_block_pool.touch(refresh)
+            self.cpu_block_pool.free_blocks(refresh)
+
+    def _request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
         req_id = request.request_id
+
+        # Diagnostics: count loads into pages of just-finished requests
+        # (LOAD_DST_RECENTLY_FREED).
+        if block_ids:
+            self._recently_freed.setdefault(self._num_steps, set()).update(block_ids)
 
         # Release any temp CPU hit pin from get_num_new_matched_tokens()
         # if request is canceled or preempted before update_state_after_alloc()
         pending = self._pending_cpu_hits.pop(req_id, None)
         if pending is not None:
             self._free_pending_cpu_hit(pending)
+        self._deferred_hits.pop(req_id, None)
+        self._cold_fallback_req_ids.discard(req_id)
+        self._local_hit_tokens.pop(req_id, None)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
@@ -770,13 +1946,15 @@ class SimpleCPUOffloadScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(request, block_ids=[])
+        self._refresh_cpu_recency(block_ids)
+        return self._request_finished(
+            request, block_ids=[bid for group in block_ids for bid in group]
+        )
 
-    def _free_pending_cpu_hit(self, pending: tuple) -> None:
+    def _free_pending_cpu_hit(self, pending: PendingCPUHit) -> None:
         """Release the temporary CPU block pin taken in get_num_new_matched_tokens()."""
-        cpu_hit_blocks, _ = pending
         blocks_to_free = [
-            blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
+            blk for grp in pending.blocks for blk in grp if not blk.is_null
         ]
         if blocks_to_free:
             self.cpu_block_pool.free_blocks(blocks_to_free)
@@ -799,12 +1977,15 @@ class SimpleCPUOffloadScheduler:
                     reqs.remove(req_id)
                 if not reqs:
                     self._load_event_to_reqs.pop(state.load_event, None)
+                    self._load_spans.pop(state.load_event, None)
+                    self._load_corrupt.pop(state.load_event, None)
+                    self._load_gate.pop(state.load_event, None)
 
         if state.transfer_meta is not None:
-            # Free CPU touch refs
+            # Free CPU touch refs, prefix head last (most recent in the LRU).
             self.cpu_block_pool.free_blocks(
                 self.cpu_block_pool.blocks[bid]
-                for bid in state.transfer_meta.cpu_block_ids
+                for bid in reversed(state.transfer_meta.cpu_block_ids)
             )
             # Free GPU touch refs
             assert self._gpu_block_pool is not None

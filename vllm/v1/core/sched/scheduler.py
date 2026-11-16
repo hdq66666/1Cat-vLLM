@@ -72,6 +72,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.simple_kv_offload.options import test_switch
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -319,6 +320,7 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            self.connector.bind_kv_cache_manager(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         # VLLM_V41_PP_MICRO: PP micro-batches. With two or more decoding
@@ -348,6 +350,13 @@ class Scheduler(SchedulerInterface):
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+        # Blocks that async KV loads will overwrite this step, skipped from
+        # zeroing since the zeroing could race the out-of-band write.
+        self._skip_zero_block_ids: set[int] = set()
+        # Test only: zero async KV load destinations as well.
+        self._zero_kv_load_blocks = bool(
+            test_switch("VLLM_SIMPLE_KV_OFFLOAD_TEST_NO_SKIP_ZERO")
+        )
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -1663,6 +1672,16 @@ class Scheduler(SchedulerInterface):
                         max(request.num_prompt_tokens, request.num_tokens - 1)
                         - num_computed_tokens,
                     )
+                    if self.needs_kv_cache_zeroing and not self._zero_kv_load_blocks:
+                        # Skip zeroing of the blocks the async load will
+                        # overwrite; the zeroing could race the write.
+                        self._skip_zero_block_ids.update(
+                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                                request.request_id,
+                                num_new_local_computed_tokens,
+                                num_computed_tokens,
+                            )
+                        )
                     continue
 
                 self.running.append(request)
@@ -1812,12 +1831,7 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        # Drain new attention block ids every step so the manager-side list
-        # does not grow unbounded; only kv-cache zeroing consumes them.
-        new_attn_block_ids = self.kv_cache_manager.take_new_block_ids()
-        new_block_ids_to_zero = (
-            (new_attn_block_ids or None) if self.needs_kv_cache_zeroing else None
-        )
+        new_block_ids_to_zero = self._get_new_block_ids_to_zero()
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
@@ -1971,6 +1985,20 @@ class Scheduler(SchedulerInterface):
             request.request_id,
             entry.key,
         )
+
+    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+        # Drain new attention block ids every step so the manager-side list
+        # does not grow unbounded; only kv-cache zeroing consumes them.
+        new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
+        if not self.needs_kv_cache_zeroing:
+            return None
+
+        if self._skip_zero_block_ids:
+            skip = self._skip_zero_block_ids
+            new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+            skip.clear()
+
+        return new_block_ids_to_zero or None
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -3122,6 +3150,18 @@ class Scheduler(SchedulerInterface):
         )
         return len(self.requests) > num_in_queues
 
+    def has_requests(self) -> bool:
+        # Override the interface default to also keep the engine stepping
+        # while the connector has background work left after the last request
+        # finished (e.g. CPU offload stores still to be submitted or
+        # completed). Empty steps carry its metadata to the workers and bring
+        # the completions back; without this the engine would go idle first.
+        return (
+            self.has_unfinished_requests()
+            or self.has_finished_requests()
+            or (self.connector is not None and self.connector.has_pending_push_work())
+        )
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -3159,6 +3199,20 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if (
+            reset_running_requests
+            and not reset_successful
+            and self.connector is not None
+            and self.connector.has_pending_push_work()
+        ):
+            # Connector stores in flight (e.g. CPU offload) still pin GPU
+            # blocks that no request owns. They complete within a few steps;
+            # report failure so the caller can retry instead of raising.
+            logger.warning(
+                "Prefix cache reset deferred: KV connector transfers still "
+                "hold GPU blocks."
+            )
+            return False
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -3332,9 +3386,18 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+                if self.needs_kv_cache_zeroing:
+                    # The failed load left the blocks beyond the valid
+                    # prefix unwritten and their zeroing was skipped; zero
+                    # them before they are recomputed locally.
+                    self.kv_cache_manager.record_blocks_for_zeroing(
+                        request.request_id, request.num_computed_tokens
+                    )
             else:
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
+                # (Freed blocks are re-recorded for zeroing when
+                # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
@@ -3450,54 +3513,84 @@ class Scheduler(SchedulerInterface):
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
+        group_specs = [
+            group.kv_cache_spec for group in self.kv_cache_config.kv_cache_groups
+        ]
+        group_block_sizes = [spec.block_size for spec in group_specs] or [
+            self.block_size
+        ]
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # One block list per KV cache group (hybrid models have several,
+            # with their own block sizes). An invalid block in any group
+            # truncates the computed prefix to the shortest valid prefix
+            # across all groups.
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            valid_tokens = req_num_computed_tokens
+            for g, (group_block_size, req_block_ids) in enumerate(
+                zip(group_block_sizes, block_ids_by_group)
+            ):
+                req_num_computed_blocks = (
+                    req_num_computed_tokens + group_block_size - 1
+                ) // group_block_size
+                is_state_group = g < len(group_specs) and isinstance(
+                    group_specs[g], MambaSpec
                 )
-                total_affected_tokens += num_affected_tokens
+                group_marked = False
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+                    if block_id not in invalid_block_ids:
+                        continue
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    is_affected = True
+
+                    if block_id in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this
+                        # block as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
+
+                    marked_invalid_block_ids.add(block_id)
+
+                    if group_marked:
+                        # This group already marked an invalid block for
+                        # recomputation and set the truncation point.
+                        continue
+
+                    group_marked = marked_invalid_block = True
+                    # Truncate the computed tokens at the first failed block
+                    # of this group. A state-space group resumes from the
+                    # state kept in a block, so the cut must land at the end
+                    # of the last real (non-null) state block before the
+                    # failed one; null entries hold no state.
+                    if is_state_group:
+                        cut = 0
+                        for j in range(idx - 1, -1, -1):
+                            if req_block_ids[j] != null_block_id:
+                                cut = (j + 1) * group_block_size
+                                break
+                    else:
+                        cut = idx * group_block_size
+                    valid_tokens = min(valid_tokens, cut)
+
+                    # collect invalid block and all downstream dependent blocks
+                    if evict_blocks:
+                        blocks_to_evict.update(req_block_ids[idx:])
+
+            if marked_invalid_block:
+                request.num_computed_tokens = valid_tokens
+                total_affected_tokens += req_num_computed_tokens - valid_tokens
 
             if is_affected:
                 if not marked_invalid_block:

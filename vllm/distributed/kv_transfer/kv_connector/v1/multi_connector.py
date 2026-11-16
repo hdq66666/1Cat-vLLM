@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -249,6 +249,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         for c in self._connectors:
             c.bind_gpu_block_pool(gpu_block_pool)
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        for c in self._connectors:
+            c.bind_kv_cache_manager(kv_cache_manager)
 
     # We must override the base class method here because we need to bind
     # the metadata to each connector in the order of the connectors in the
@@ -654,3 +658,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def reset_cache(self) -> bool:
         results = [c.reset_cache() is not False for c in self._connectors]
         return all(results)
+
+    def has_pending_push_work(self) -> bool:
+        return any(c.has_pending_push_work() for c in self._connectors)

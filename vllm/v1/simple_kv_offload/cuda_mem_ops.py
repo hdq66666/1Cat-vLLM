@@ -26,6 +26,25 @@ def pin_tensor(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
 
 
+def unpin_tensor(tensor: torch.Tensor) -> None:
+    """Undo :func:`pin_tensor`."""
+    err = torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+    if err.value != 0:
+        raise RuntimeError(f"cudaHostUnregister failed: {err}")
+
+
+def driver_version() -> int | None:
+    """CUDA driver API version (e.g. 12080), or None where it is unknown."""
+    if current_platform.is_rocm():
+        return None
+    try:
+        from cuda.bindings import driver as drv
+    except ImportError:
+        return None
+    err, version = drv.cuDriverGetVersion()
+    return version if err == drv.CUresult.CUDA_SUCCESS else None
+
+
 class _CUmemLocation(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint), ("id", ctypes.c_int)]
 
@@ -52,8 +71,9 @@ _BATCH_MEMCPY_FUNC_TYPE = ctypes.CFUNCTYPE(
     ctypes.c_void_p,
 )
 
-# Resolved lazily on first use.
+# Resolved lazily on first use; stays None where the batch API is unavailable.
 _batch_memcpy_fn: Any = None
+_batch_memcpy_resolved: bool = False
 
 
 def _resolve_batch_memcpy():
@@ -66,19 +86,21 @@ def _resolve_batch_memcpy():
       (see ROCm/clr @ rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so
       we call with ``numAttrs=0``.
 
-    Raises ``RuntimeError`` if the symbol is unavailable (older CUDA
-    driver, ROCm < 7.1, unusual install). The connector requires the
-    batch API.
+    Returns None if the symbol is unavailable (older CUDA driver, no
+    cuda-python, ROCm < 7.1, unusual install); the copy backend then falls
+    back to per-block cudaMemcpyAsync.
     """
     if current_platform.is_rocm():
         try:
             lib = ctypes.CDLL("libamdhip64.so", mode=ctypes.RTLD_GLOBAL)
             fn = lib.hipMemcpyBatchAsync
         except (OSError, AttributeError) as e:
-            raise RuntimeError(
-                "hipMemcpyBatchAsync is unavailable in this ROCm install; "
-                "SimpleCPUOffloadConnector requires ROCm 7.1+."
-            ) from e
+            logger.warning(
+                "hipMemcpyBatchAsync is unavailable in this ROCm install "
+                "(requires ROCm 7.1+): %s",
+                e,
+            )
+            return None
         fn.restype = ctypes.c_uint
         fn.argtypes = [
             ctypes.c_void_p,  # dsts
@@ -93,12 +115,26 @@ def _resolve_batch_memcpy():
         ]
         return fn
 
-    from cuda.bindings import driver as drv
+    try:
+        from cuda.bindings import driver as drv
+    except ImportError as e:
+        logger.warning("cuMemcpyBatchAsync needs cuda-python: %s", e)
+        return None
 
     err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
-    if err != drv.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuGetProcAddress(cuMemcpyBatchAsync) failed: {err}")
+    if err != drv.CUresult.CUDA_SUCCESS or not ptr:
+        logger.warning("cuGetProcAddress(cuMemcpyBatchAsync) failed: %s", err)
+        return None
     return _BATCH_MEMCPY_FUNC_TYPE(ptr)
+
+
+def get_batch_memcpy_fn() -> Any:
+    """The batch-memcpy entry point, or None where it is unavailable."""
+    global _batch_memcpy_fn, _batch_memcpy_resolved
+    if _batch_memcpy_fn is None and not _batch_memcpy_resolved:
+        _batch_memcpy_fn = _resolve_batch_memcpy()
+        _batch_memcpy_resolved = True
+    return _batch_memcpy_fn
 
 
 class BatchMemcpyParams(NamedTuple):
@@ -122,10 +158,6 @@ def build_params(
     stream: torch.cuda.Stream,
     src_access_order_any: bool = True,
 ) -> BatchMemcpyParams:
-    global _batch_memcpy_fn
-    if _batch_memcpy_fn is None:
-        _batch_memcpy_fn = _resolve_batch_memcpy()
-
     assert list(src_caches.keys()) == list(dst_caches.keys())
     src_tensors = list(src_caches.values())
     dst_tensors = list(dst_caches.values())
@@ -169,6 +201,9 @@ def copy_blocks(
     n = len(src_block_ids)
     if n == 0:
         return
+    batch_memcpy_fn = get_batch_memcpy_fn()
+    if batch_memcpy_fn is None:
+        raise RuntimeError("batch memcpy is unavailable on this platform")
 
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
@@ -187,7 +222,7 @@ def copy_blocks(
     # srcAccessOrder is honored. attrs / attrsIdxs are ignored when
     # numAttrs==0, so we pass the same values from both paths.
     num_attrs = 0 if current_platform.is_rocm() else 1
-    err = _batch_memcpy_fn(
+    err = batch_memcpy_fn(
         dst_all.ctypes.data,
         src_all.ctypes.data,
         sz_all.ctypes.data,
@@ -202,3 +237,53 @@ def copy_blocks(
         raise RuntimeError(
             f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
         )
+
+
+class SwapBlocksParams(NamedTuple):
+    """Per-region views for the per-block cudaMemcpyAsync fallback."""
+
+    src_regions: list[torch.Tensor]  # [num_blocks, block_bytes] per region
+    dst_regions: list[torch.Tensor]
+    bpb: list[int]  # bytes per block per region
+    stream: torch.cuda.Stream
+
+
+def build_swap_params(
+    src_caches: dict[str, torch.Tensor],
+    dst_caches: dict[str, torch.Tensor],
+    stream: torch.cuda.Stream,
+) -> SwapBlocksParams:
+    assert list(src_caches.keys()) == list(dst_caches.keys())
+    src_regions = list(src_caches.values())
+    dst_regions = list(dst_caches.values())
+
+    bpb = []
+    for s, d in zip(src_regions, dst_regions):
+        s_bpb = s.stride(0) * s.element_size()
+        assert s_bpb == d.stride(0) * d.element_size()
+        bpb.append(s_bpb)
+    return SwapBlocksParams(src_regions, dst_regions, bpb, stream)
+
+
+def swap_copy_blocks(
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    params: SwapBlocksParams,
+) -> None:
+    """Copy blocks with one cudaMemcpyAsync per block and region.
+
+    ``swap_blocks`` issues the copies on the current stream and reads the
+    mapping on the host before it returns, so one CPU mapping serves every
+    region.
+    """
+    # Imported here: only this fallback needs the custom ops, and this module
+    # is also imported where they are not loaded (e.g. the stats logger).
+    from vllm import _custom_ops as ops
+
+    if not src_block_ids:
+        return
+    mapping = torch.tensor([src_block_ids, dst_block_ids], dtype=torch.int64)
+    mapping = mapping.t().contiguous()
+    with torch.cuda.stream(params.stream):
+        for src, dst, bpb in zip(params.src_regions, params.dst_regions, params.bpb):
+            ops.swap_blocks(src, dst, bpb, mapping)

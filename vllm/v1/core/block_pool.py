@@ -239,6 +239,13 @@ class BlockPool:
             )
 
         self.enable_kv_cache_events = enable_kv_cache_events
+        # Step counter maintained by the owner (e.g. a KV connector) and
+        # stamped on blocks as they are freed. With quarantine_steps > 0,
+        # get_new_blocks() hands out blocks freed within that many steps
+        # only when nothing older is free (counted in quarantine_fallbacks).
+        self.current_step = 0
+        self.quarantine_steps = 0
+        self.quarantine_fallbacks = 0
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -453,11 +460,15 @@ class BlockPool:
             if _shortage > 0:
                 self._promote_warm_blocks(_shortage, kv_cache_group_id)
 
-        ret: list[KVCacheBlock] = (
-            self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
-            if isinstance(self.free_block_queue, _PartitionedBlockQueue)
-            else self.free_block_queue.popleft_n(num_blocks)
-        )
+        ret: list[KVCacheBlock]
+        if isinstance(self.free_block_queue, _PartitionedBlockQueue):
+            ret = self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
+        elif self.quarantine_steps > 0:
+            # Diagnostics (SimpleCPU freed_block_quarantine_steps): prefer
+            # blocks freed before the quarantine window. Single queue only.
+            ret = self._pop_quarantined(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -465,14 +476,34 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.alloc_generation += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.alloc_generation += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def _pop_quarantined(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop free blocks in queue order, skipping blocks freed within the
+        last quarantine_steps steps while older ones are available."""
+        oldest_ok = self.current_step - self.quarantine_steps
+        ret: list[KVCacheBlock] = []
+        node = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        while node is not None and node is not tail and len(ret) < num_blocks:
+            nxt = node.next_free_block
+            if node.freed_at_step <= oldest_ok:
+                self.free_block_queue.remove(node)
+                ret.append(node)
+            node = nxt
+        if len(ret) < num_blocks:
+            self.quarantine_fallbacks += num_blocks - len(ret)
+            ret.extend(self.free_block_queue.popleft_n(num_blocks - len(ret)))
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -579,6 +610,8 @@ class BlockPool:
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
+        for block in freed_blocks:
+            block.freed_at_step = self.current_step
         if self.enable_caching:
             # Uncached scratch has no reusable prefix to evict, and blocks a
             # sliding window has moved past (``reuse_first``) can never serve a

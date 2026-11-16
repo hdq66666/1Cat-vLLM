@@ -84,6 +84,8 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.simple_kv_offload.host_mem import check_host_mem_before_pinning
+from vllm.v1.simple_kv_offload.options import parse_options
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
@@ -100,6 +102,28 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 
 _NO_DRAFTS = object()
+
+
+def _check_simple_cpu_offload_host_mem(vllm_config: VllmConfig) -> None:
+    """Refuse to start if pinning the whole SimpleCPUOffload CPU tier (every
+    rank of this engine) would leave too little host MemAvailable."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config is None
+        or kv_transfer_config.kv_connector != "SimpleCPUOffloadConnector"
+        # The connector does not allocate the tier without prefix caching.
+        or not vllm_config.cache_config.enable_prefix_caching
+    ):
+        return
+    options = parse_options(kv_transfer_config.kv_connector_extra_config)
+    parallel_config = vllm_config.parallel_config
+    # Each rank pins its share on its own node; workers re-check per rank.
+    local_ranks = parallel_config.local_world_size
+    check_host_mem_before_pinning(
+        options.cpu_bytes_per_rank(parallel_config.world_size) * local_ranks,
+        options.min_host_mem_available_gib,
+        "EngineCore",
+    )
 
 
 class EngineCore:
@@ -137,6 +161,10 @@ class EngineCore:
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
+
+        # The workers pin the SimpleCPUOffload tier while the KV caches are
+        # initialized; check host memory for all of them before that.
+        _check_simple_cpu_offload_host_mem(vllm_config)
 
         # Setup KV Caches and update CacheConfig after profiling.
         kv_cache_config = self._initialize_kv_caches(vllm_config)
@@ -1044,9 +1072,25 @@ class EngineCore:
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
         if clear_cache:
+            if mode == "abort":
+                self._drain_connector_push_work()
             self._reset_caches()
 
         return None
+
+    def _drain_connector_push_work(self, max_steps: int = 100_000) -> None:
+        """Step until the KV connector's background work (e.g. CPU offload
+        stores pinning GPU blocks) is done. The in-proc engine is not stepped
+        while paused, so a cache reset right after an abort would otherwise
+        find those blocks still pinned."""
+        connector = getattr(self.scheduler, "connector", None)
+        if connector is None:
+            return
+        for _ in range(max_steps):
+            if not connector.has_pending_push_work():
+                return
+            self.step_fn()
+        logger.warning("KV connector work still pending after %d steps", max_steps)
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""

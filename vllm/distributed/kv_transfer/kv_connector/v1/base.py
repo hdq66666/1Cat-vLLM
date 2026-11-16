@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -465,6 +465,17 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        """
+        Bind the scheduler's KV cache manager to the connector, for connectors
+        that need the allocator's own view (e.g. how many GPU blocks a hit
+        would take) before reporting external hits.
+
+        Args:
+            kv_cache_manager: the scheduler's KVCacheManager.
+        """
+        return
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,
@@ -636,6 +647,15 @@ class KVConnectorBase_V1(ABC):
         """
 
         return None
+
+    def has_pending_push_work(self) -> bool:
+        """Return True if the connector has work that requires the engine
+        main loop to keep stepping after all requests have finished (e.g.
+        CPU offload stores still to be submitted or completed).
+
+        Connectors without such background work leave this as False.
+        """
+        return False
 
     @classmethod
     def build_kv_connector_stats(
