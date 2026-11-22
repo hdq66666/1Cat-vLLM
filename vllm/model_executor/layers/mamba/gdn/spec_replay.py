@@ -16,6 +16,14 @@ replays side ``s ^ 1``; the host flips ``s`` once per verified step.
 Aligned prefix-cache checkpoints are stored by the verification itself, at
 the in-round position that ends a Mamba block; a rejected position is simply
 rewritten by the round that processes it again.
+
+A round that ends exactly on a block boundary is the exception: its running
+state lives in the block that ends there, and that slot must keep the
+committed state the next round replays onto. Such a round stores no
+checkpoint. If its tokens are all accepted, the next round starts on the
+boundary and stores the replayed state, which is the boundary state, to that
+block instead (checkpoint token -1); otherwise the next round still crosses
+the boundary and stores it in-round as usual.
 """
 
 from __future__ import annotations
@@ -209,10 +217,24 @@ def _prepare_replay_rows_kernel(
         start = tl.load(query_start_loc_ptr + rows, mask=live, other=0)
         end = tl.load(query_start_loc_ptr + rows + 1, mask=live, other=0)
         boundary = ((computed + end - start) // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
-        has_ckpt = live & (boundary > computed)
-        ckpt_token = tl.where(has_ckpt, boundary - 1 - computed, -1)
+        # A round ending exactly on the boundary runs in the block that ends
+        # there ((seq_len - 1) // block): an in-round checkpoint would land in
+        # the running slot and overwrite its committed state with unverified
+        # positions. Skip it; a round that starts on a boundary after replaying
+        # accepted tokens stores that boundary from its replay instead.
+        ends_on_boundary = ((computed + end - start) % MAMBA_BLOCK_SIZE) == 0
+        in_round = live & (boundary > computed) & (ends_on_boundary == 0)
+        at_start = (
+            live & (replay > 0) & (computed > 0) & ((computed % MAMBA_BLOCK_SIZE) == 0)
+        )
+        has_ckpt = in_round | at_start
+        ckpt_token = tl.where(in_round, boundary - 1 - computed, -1)
         tl.store(spec_ckpt_token_ptr + offsets, ckpt_token, mask=in_table)
-        column = boundary // MAMBA_BLOCK_SIZE - 1
+        column = tl.where(
+            in_round,
+            boundary // MAMBA_BLOCK_SIZE - 1,
+            computed // MAMBA_BLOCK_SIZE - 1,
+        )
         for group in tl.static_range(NUM_GROUPS):
             table = tl.load(block_table_ptrs_ptr + group).to(tl.pointer_type(tl.int32))
             slot = tl.load(
