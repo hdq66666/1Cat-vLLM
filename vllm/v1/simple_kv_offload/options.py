@@ -43,6 +43,10 @@ class SimpleCPUOffloadOptions:
     # Refuse to start when host MemAvailable minus the CPU tier would fall
     # below this many GiB.
     min_host_mem_available_gib: float = 15.0
+    # Before and after pinning, a MemAvailable reading below the floor is
+    # retried for up to this many seconds before the start is refused: while
+    # the server starts, other processes hold host memory for a few seconds.
+    host_mem_settle_s: float = 60.0
     # Log a warning while host MemAvailable is below this many GiB.
     host_mem_warn_gib: float = 12.0
     # A load or store that does not complete within this many seconds is
@@ -217,6 +221,7 @@ def parse_options(extra_config: dict[str, Any] | None) -> SimpleCPUOffloadOption
         kwargs["probe_every"] = _as_int("probe_every", cfg["probe_every"], 1)
     for key, minimum in (
         ("min_host_mem_available_gib", 0.0),
+        ("host_mem_settle_s", 0.0),
         ("host_mem_warn_gib", 0.0),
         ("transfer_timeout_s", 1.0),
         ("cpu_hit_admission_wait_s", 0.0),

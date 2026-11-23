@@ -295,3 +295,81 @@ def test_host_mem_checks(monkeypatch) -> None:
     available[0] = None
     host_mem.check_host_mem_before_pinning(32 * GiB, 15.0, "test")
     host_mem.check_host_mem_after_pinning(15.0, "test")
+
+
+class _FakeTime:
+    """Fake clock and sleep for the settle loop."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _readings(monkeypatch, values: list[float | None], fake: _FakeTime) -> None:
+    """MemAvailable readings in GiB, one per read; the last one repeats."""
+    remaining = list(values)
+
+    def read() -> int | None:
+        value = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return None if value is None else int(value * GiB)
+
+    monkeypatch.setattr(host_mem, "read_mem_available_bytes", read)
+    monkeypatch.setattr(host_mem.time, "monotonic", fake.clock)
+    monkeypatch.setattr(host_mem.time, "sleep", fake.sleep)
+
+
+def test_after_pinning_waits_out_a_transient_dip(monkeypatch) -> None:
+    # Seen on the V100 host: 9.3 GiB right after pinning, 17.5 on another start.
+    fake = _FakeTime()
+    _readings(monkeypatch, [9.3, 9.6, 12.4], fake)
+    host_mem.check_host_mem_after_pinning(10.0, "test", settle_s=60.0)
+    assert fake.now == 2 * host_mem.SETTLE_POLL_S
+
+
+def test_after_pinning_still_refuses_memory_that_stays_short(monkeypatch) -> None:
+    fake = _FakeTime()
+    _readings(monkeypatch, [9.3, 9.4, 9.2], fake)
+    with pytest.raises(ValueError, match=r"after the CPU KV.*waited 60 s"):
+        host_mem.check_host_mem_after_pinning(10.0, "test", settle_s=60.0)
+    assert fake.now == pytest.approx(60.0)
+
+
+def test_before_pinning_waits_for_room_for_the_tier(monkeypatch) -> None:
+    fake = _FakeTime()
+    # 48 GiB tier, 10 GiB floor: needs 58 GiB; 56.3 at first, 59.1 later.
+    _readings(monkeypatch, [56.3, 59.1], fake)
+    host_mem.check_host_mem_before_pinning(48 * GiB, 10.0, "test", settle_s=60.0)
+    assert fake.now == host_mem.SETTLE_POLL_S
+
+    fake = _FakeTime()
+    _readings(monkeypatch, [54.1], fake)
+    with pytest.raises(ValueError, match=r"would leave 6\.10 GiB.*waited 60 s"):
+        host_mem.check_host_mem_before_pinning(48 * GiB, 10.0, "test", settle_s=60.0)
+
+
+def test_settle_zero_reads_once(monkeypatch) -> None:
+    fake = _FakeTime()
+    _readings(monkeypatch, [9.3, 50.0], fake)
+    with pytest.raises(ValueError, match="after the CPU KV"):
+        host_mem.check_host_mem_after_pinning(10.0, "test", settle_s=0.0)
+    assert fake.sleeps == []
+
+
+def test_unknown_mem_available_while_waiting_does_not_block(monkeypatch) -> None:
+    fake = _FakeTime()
+    _readings(monkeypatch, [9.3, None], fake)
+    host_mem.check_host_mem_after_pinning(10.0, "test", settle_s=60.0)
+
+
+def test_settle_option_parsing() -> None:
+    assert parse_options({}).host_mem_settle_s == 60.0
+    assert parse_options({"host_mem_settle_s": 0}).host_mem_settle_s == 0.0
+    with pytest.raises(ValueError):
+        parse_options({"host_mem_settle_s": -1})

@@ -123,6 +123,7 @@ def _check_simple_cpu_offload_host_mem(vllm_config: VllmConfig) -> None:
         options.cpu_bytes_per_rank(parallel_config.world_size) * local_ranks,
         options.min_host_mem_available_gib,
         "EngineCore",
+        settle_s=options.host_mem_settle_s,
     )
 
 

@@ -62,6 +62,8 @@ PROD_CONFIG = {
     "cpu_bytes_to_use": 32 * GiB,
     "lazy_offload": True,
     "min_host_mem_available_gib": 15,
+    # One reading per check; test_options_stats covers the settle loop.
+    "host_mem_settle_s": 0,
 }
 
 
