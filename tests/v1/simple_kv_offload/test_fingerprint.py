@@ -658,3 +658,78 @@ def test_cpu_corrupt_modes_damage_the_rows_before_the_copy(mode, positions):
     chain.load_seen_complete(0)
     _steps(chain, 1)
     assert "watch +0 steps" not in chain.reports  # nothing damaged after the load
+
+
+# ----------------------------------------------------------------------
+# The chain only watches: it must neither fail transfers nor grow forever.
+# ----------------------------------------------------------------------
+
+
+def test_an_error_turns_the_chain_off_instead_of_failing_the_transfer(monkeypatch):
+    chain, gpu, cpu = _make()
+    _store(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9])
+    chain.drain()
+
+    def out_of_memory(*args, **kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(chain, "_host_buffer", out_of_memory)
+    # None of these may raise into the copy loop or the engine step.
+    chain.store_launched(1, [3], [10], None)
+    assert chain.failed
+    assert chain.snapshot(None) is None
+    assert chain.nonfinite(None, (True, 1)) is None
+    chain.transfer_issued(True, 1, None, None, None)
+    chain.load_launched(0, [7, 8, 9], [1, 2, 6])
+    chain.load_seen_complete(0)
+    _steps(chain, WATCH_STEPS[-1] + 2)
+    # A gated load does not wait for a verdict that will never come.
+    assert chain.pop_load_verdict(0) == []
+    # Nothing is queued any more, so no host buffer is held.
+    assert chain._queue.empty()
+
+
+def test_a_failed_checker_thread_stops_the_producers(monkeypatch):
+    chain, gpu, cpu = _make()
+
+    def broken(job):
+        raise RuntimeError("checker bug")
+
+    monkeypatch.setattr(chain, "process", broken)
+    _store(chain, gpu, cpu, 0, [3, 4, 5], [7, 8, 9])
+    chain._run()  # the thread body, run here
+    assert chain.failed
+    queued = chain._queue.qsize()
+    _store(chain, gpu, cpu, 1, [3, 4, 5], [7, 8, 9])
+    chain.tick(None)
+    assert chain._queue.qsize() == queued
+
+
+def test_store_blocks_are_dropped_once_counted():
+    chain, gpu, cpu, gv, cv = _make_typed()
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE]
+    for event in range(50):
+        _store_typed(chain, gpu, cpu, event, [3, 4, 5], [7, 8, 9], kinds)
+        chain.drain()
+    assert not [key for key in chain._event_blocks if key[0]]
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 16])
+def test_nonfinite_counts_do_not_depend_on_the_chunk(monkeypatch, chunk):
+    import vllm.v1.simple_kv_offload.fingerprint as fingerprint
+
+    chain, gpu, cpu, gv, cv = _make_typed()
+    gv["fa"][0][1][4, 0] = float("nan")
+    gv["fa"][1][1][4, 1] = float("inf")
+    gv["fa"][1][1][9, 2] = float("nan")
+    gv["state"][0][1][5, 0] = float("nan")
+    gpu_ids = [3, 4, 5, 9, 0]
+    kinds = [BLOCK_ATTN, BLOCK_ATTN, BLOCK_STATE, BLOCK_ATTN, BLOCK_STATE]
+
+    monkeypatch.setattr(fingerprint, "NONFINITE_CHUNK_BLOCKS", chunk)
+    counts = chain.count_nonfinite(None, gpu_ids, kinds).wait()
+
+    fa, state = chain.names.index("fa"), chain.names.index("state")
+    skipped = fingerprint.NOT_COUNTED
+    assert counts[fa].tolist() == [0, 2, skipped, 1, skipped]
+    assert counts[state].tolist() == [skipped, skipped, 1, skipped, 0]
