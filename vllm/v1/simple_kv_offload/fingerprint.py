@@ -43,9 +43,11 @@ differs from its CPU copy or carries non-finite values) is kept for the
 worker, which may hold the load back from the scheduler on it.
 """
 
+import functools
 import queue
 import threading
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import torch
 
@@ -73,6 +75,33 @@ REGION_PARTS = ("k", "v", "attn", "state")
 
 # [regions, n] non-finite counts use -1 where a region was not counted.
 NOT_COUNTED = -1
+# Blocks gathered at a time to count non-finite values: one gather copies
+# every block it covers, on a GPU that may have little memory to spare.
+NONFINITE_CHUNK_BLOCKS = 16
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _fail_safe(default: Any = None) -> Callable[[_F], _F]:
+    """The chain only watches transfers. An error in it must not fail the
+    transfer it watches (and with it the engine): it logs once, turns the
+    chain off and returns *default*."""
+
+    def wrap(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def call(self: "FingerprintChain", *args: Any, **kwargs: Any) -> Any:
+            if self.failed:
+                return default
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception:
+                self._turn_off(fn.__name__)
+                return default
+
+        return call  # type: ignore[return-value]
+
+    return wrap
+
 
 Views = dict[str, list[tuple[str, torch.Tensor]]]
 
@@ -179,6 +208,8 @@ class FingerprintChain:
         attention regions are group BLOCK_ATTN and state regions group
         BLOCK_STATE."""
         self.rank = rank
+        # Set by the first error in the chain; it then does nothing.
+        self.failed = False
         self.names = list(gpu_regions)
         # int64 views [blocks, words]: reductions over them allocate nothing
         # but their [blocks] result.
@@ -312,8 +343,9 @@ class FingerprintChain:
             with self._lock:
                 self._free.append(snap.host)
 
+    @_fail_safe()
     @torch.inference_mode()
-    def snapshot(self, stream: Any) -> Snapshot:
+    def snapshot(self, stream: Any) -> Snapshot | None:
         # Host buffers are shared by the engine thread (inference mode) and
         # the copy thread: every use of them runs in inference mode.
         host = self._host_buffer()
@@ -327,11 +359,18 @@ class FingerprintChain:
             event.record(stream)
         return Snapshot(host, event)
 
+    @_fail_safe()
     @torch.inference_mode()
     def nonfinite(self, stream: Any, key: tuple[bool, int]) -> Snapshot | None:
         """Non-finite counts of a launched transfer's GPU blocks (copy
         thread); None when nothing is counted."""
-        blocks = self._event_blocks.get(key)
+        # A store's blocks are only needed here; a load's also by tick().
+        is_store = key[0]
+        blocks = (
+            self._event_blocks.pop(key, None)
+            if is_store
+            else self._event_blocks.get(key)
+        )
         if blocks is None:
             return None
         return self.count_nonfinite(stream, *blocks)
@@ -379,11 +418,14 @@ class FingerprintChain:
                 pos = positions.get(self._region_group[r])
                 if not pos:
                     continue
-                ids = index([gpu_ids[i] for i in pos])
-                total: torch.Tensor | None = None
-                for _, view, _ in parts:
-                    c = (~torch.isfinite(view[ids])).flatten(1).sum(dim=1)
-                    total = c if total is None else total + c
+                ids = [gpu_ids[i] for i in pos]
+                total = torch.zeros(len(ids), dtype=torch.int64, device=device)
+                for lo in range(0, len(ids), NONFINITE_CHUNK_BLOCKS):
+                    chunk = index(ids[lo : lo + NONFINITE_CHUNK_BLOCKS])
+                    for _, view, _ in parts:
+                        total[lo : lo + len(chunk)] += (
+                            (~torch.isfinite(view[chunk])).flatten(1).sum(dim=1)
+                        )
                 out[r, index(pos)] = total
             return out
 
@@ -431,6 +473,7 @@ class FingerprintChain:
     # ------------------------------------------------------------------
     # Main thread
     # ------------------------------------------------------------------
+    @_fail_safe()
     def store_launched(
         self,
         event_idx: int,
@@ -444,10 +487,13 @@ class FingerprintChain:
             self._cpu_seq[cid] = self._seq
         self._event_blocks[(True, event_idx)] = (list(gpu_ids), kinds)
         snap = self.snapshot(stream)
+        if snap is None:  # the chain just turned off
+            return
         self._queue.put(
             ("store_launch", event_idx, list(gpu_ids), list(cpu_ids), snap, self._seq)
         )
 
+    @_fail_safe()
     def load_launched(
         self,
         event_idx: int,
@@ -496,6 +542,7 @@ class FingerprintChain:
             ("load_launch", event_idx, list(cpu_ids), list(gpu_ids), seqs, kinds)
         )
 
+    @_fail_safe()
     def load_seen_complete(self, event_idx: int) -> None:
         blocks = self._load_blocks.pop(event_idx, None)
         if blocks is None:
@@ -604,6 +651,7 @@ class FingerprintChain:
             targets,
         )
 
+    @_fail_safe()
     def tick(self, stream: Any) -> None:
         """Once per engine step, after the step's transfers were submitted."""
         due = self._watches.pop(self._step, None)
@@ -624,6 +672,8 @@ class FingerprintChain:
                 continue
             if snap is None:
                 snap = self.snapshot(stream)
+                if snap is None:  # the chain just turned off
+                    return
             kinds = self._event_blocks.get((False, event_idx), (None, None))[1]
             nf = self.count_nonfinite(stream, gpu_ids, kinds)
             self._queue.put(("watch", event_idx, k, gpu_ids, snap, nf))
@@ -632,22 +682,24 @@ class FingerprintChain:
         if snap is not None:
             self._queue.put(("release", snap))
 
+    @_fail_safe(default=[])
     def pop_load_verdict(self, event_idx: int) -> list[int] | None:
         """Positions of a completed load's bad blocks (differing from the
         CPU copy, or non-finite), or None while the checker has not
-        finished with the load."""
+        finished with the load. Once the chain is off: none."""
         with self._lock:
             return self._verdicts.pop(event_idx, None)
 
     # ------------------------------------------------------------------
     # Copy thread
     # ------------------------------------------------------------------
+    @_fail_safe()
     def transfer_issued(
         self,
         is_store: bool,
         event_idx: int,
         pre: Snapshot | None,
-        post: Snapshot,
+        post: Snapshot | None,
         done: Any,
         nonfinite: Snapshot | None = None,
     ) -> None:
@@ -657,6 +709,17 @@ class FingerprintChain:
 
     def close(self) -> None:
         self._queue.put(None)
+
+    def _turn_off(self, where: str) -> None:
+        if self.failed:
+            return
+        self.failed = True
+        logger.exception(
+            "SimpleCPU fp rank=%d: error in %s; the fingerprint chain is off "
+            "from now on, transfers continue unchecked",
+            self.rank,
+            where,
+        )
 
     # ------------------------------------------------------------------
     # Checker thread
@@ -671,7 +734,8 @@ class FingerprintChain:
                     return
                 self.process(job)
         except BaseException:
-            logger.exception("SimpleCPU fp checker thread failed; checks stopped")
+            # Without the checker nothing frees the queued snapshots.
+            self._turn_off("the checker thread")
 
     def drain(self) -> None:
         """Process queued jobs on the calling thread (tests)."""
