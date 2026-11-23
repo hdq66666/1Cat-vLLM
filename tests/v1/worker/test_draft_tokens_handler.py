@@ -10,12 +10,10 @@ import vllm.v1.worker.gpu.spec_decode.utils as spec_utils
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
 
-def _make_handler(monkeypatch=None) -> tuple[DraftTokensHandler, torch.device]:
+def _make_handler(monkeypatch) -> tuple[DraftTokensHandler, torch.device]:
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
         return DraftTokensHandler(device), device
-
-    assert monkeypatch is not None
 
     class _DummyStream:
         def wait_stream(self, _other) -> None:
@@ -36,7 +34,7 @@ def _make_handler(monkeypatch=None) -> tuple[DraftTokensHandler, torch.device]:
     return DraftTokensHandler(device), device
 
 
-def test_interleaved_prefill_preserves_structured_draft_tokens(monkeypatch=None):
+def test_interleaved_prefill_preserves_structured_draft_tokens(monkeypatch):
     handler, device = _make_handler(monkeypatch)
 
     # Step 1: decode batch with a structured-output request proposes 4 drafts.
@@ -97,7 +95,7 @@ def test_interleaved_prefill_preserves_structured_draft_tokens(monkeypatch=None)
     _ = spec_utils
 
 
-def test_non_structured_fallback_returns_placeholder_rows(monkeypatch=None):
+def test_non_structured_fallback_returns_placeholder_rows(monkeypatch):
     handler, device = _make_handler(monkeypatch)
     batch = SimpleNamespace(
         req_ids=["r0", "r1"],
