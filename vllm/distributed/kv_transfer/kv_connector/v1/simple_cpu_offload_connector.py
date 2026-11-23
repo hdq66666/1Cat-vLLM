@@ -124,7 +124,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # The scheduler is built after every worker pinned its CPU tier
             # (EngineCore initializes the KV caches first).
             check_host_mem_after_pinning(
-                options.min_host_mem_available_gib, "SimpleCPUOffloadConnector"
+                options.min_host_mem_available_gib,
+                "SimpleCPUOffloadConnector",
+                settle_s=options.host_mem_settle_s,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
