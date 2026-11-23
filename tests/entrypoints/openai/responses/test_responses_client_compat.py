@@ -397,11 +397,9 @@ def _serving():
     )
 
 
-async def _stream(request, chunks, prompt, finish_reason="stop"):
-    """Drive the streaming path with token chunks, as the engine would."""
+def _engine_outputs(context, chunks, prompt, finish_reason):
+    """Feed token chunks into *context*, as the engine would."""
     tokenizer = _tokenizer()
-    serving = _serving()
-    context = SimpleContext()
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
     async def generator():
@@ -429,18 +427,38 @@ async def _stream(request, chunks, prompt, finish_reason="stop"):
             )
             yield context
 
+    return generator()
+
+
+async def _stream(request, chunks, prompt, finish_reason="stop"):
+    """Drive the streaming path with token chunks, as the engine would."""
+    context = SimpleContext()
     return [
         event
-        async for event in serving.responses_stream_generator(
+        async for event in _serving().responses_stream_generator(
             request,
             SamplingParams(max_tokens=1024),
-            generator(),
+            _engine_outputs(context, chunks, prompt, finish_reason),
             context,
             "Qwen3.8",
-            tokenizer,
+            _tokenizer(),
             RequestResponseMetadata(request_id="req"),
         )
     ]
+
+
+async def _full(request, chunks, prompt, finish_reason="stop"):
+    """Drive the non-streaming path with token chunks."""
+    context = SimpleContext()
+    return await _serving().responses_full_generator(
+        request,
+        SamplingParams(max_tokens=1024),
+        _engine_outputs(context, chunks, prompt, finish_reason),
+        context,
+        "Qwen3.8",
+        _tokenizer(),
+        RequestResponseMetadata(request_id="req"),
+    )
 
 
 THINKING_PROMPT = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
@@ -526,6 +544,136 @@ async def test_streamed_tool_call_is_complete(chunks):
         done[0].call_id,
         done[0].arguments,
     )
+
+
+CUT_OFF_CALLS = {
+    "token-by-token": [
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>\n",
+        "Par",
+    ],
+    "burst": ["<tool_call>\n<function=get_weather>\n", "<parameter=city>\nPar"],
+}
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", CUT_OFF_CALLS.values(), ids=CUT_OFF_CALLS.keys())
+async def test_tool_call_cut_off_by_the_token_limit_is_incomplete(chunks):
+    """A full parse would close the JSON around "Par"; a client that runs
+    calls from stream events alone must see that the call was cut off."""
+    request = ResponsesRequest(
+        input="weather in Paris?", stream=True, tools=[WEATHER_TOOL], store=False
+    )
+    events = await _stream(request, chunks, PLAIN_PROMPT, finish_reason="length")
+
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [(i.type, i.status) for i in done] == [("function_call", "incomplete")]
+    streamed_args = "".join(
+        e.delta for e in events if e.type == "response.function_call_arguments.delta"
+    )
+    assert done[0].arguments == streamed_args
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(done[0].arguments)
+
+    completed = events[-1]
+    assert completed.response.status == "incomplete"
+    (final,) = completed.response.output
+    assert (final.id, final.status) == (done[0].id, "incomplete")
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_tool_call_cut_off_before_the_stream_opened_it_is_not_sent():
+    request = ResponsesRequest(
+        input="weather in Paris?", stream=True, tools=[WEATHER_TOOL], store=False
+    )
+    events = await _stream(
+        request,
+        ["<tool_call>\n<function=get_weather>\n<parameter=city>\nPar"],
+        PLAIN_PROMPT,
+        finish_reason="length",
+    )
+
+    assert not [e for e in events if e.type == "response.output_item.done"]
+    completed = events[-1]
+    assert completed.response.status == "incomplete"
+    assert completed.response.output == []
+
+
+COMPLETE_CALLS = {
+    "token-by-token": [
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>\n",
+        "Paris\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    ],
+    # Speculative decoding: the body and the end arrive together.
+    "burst": [
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+    ],
+    "single-delta": [
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n"
+        "</parameter>\n</function>\n</tool_call>",
+    ],
+}
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", COMPLETE_CALLS.values(), ids=COMPLETE_CALLS.keys())
+async def test_tool_call_that_ended_at_the_token_limit_stays_completed(chunks):
+    request = ResponsesRequest(
+        input="weather in Paris?", stream=True, tools=[WEATHER_TOOL], store=False
+    )
+    events = await _stream(request, chunks, PLAIN_PROMPT, finish_reason="length")
+
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [(i.type, i.status) for i in done] == [("function_call", "completed")]
+    assert json.loads(done[0].arguments) == {"city": "Paris"}
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_only_the_call_the_token_limit_cut_off_is_incomplete():
+    request = ResponsesRequest(
+        input="weather in Paris and Berlin?",
+        stream=True,
+        tools=[WEATHER_TOOL],
+        store=False,
+    )
+    chunks = [
+        *COMPLETE_CALLS["token-by-token"],
+        "\n<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>\n",
+        "Ber",
+    ]
+    events = await _stream(request, chunks, PLAIN_PROMPT, finish_reason="length")
+
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    assert [(i.type, i.status) for i in done] == [
+        ("function_call", "completed"),
+        ("function_call", "incomplete"),
+    ]
+    assert json.loads(done[0].arguments) == {"city": "Paris"}
+
+
+@needs_qwen38
+@pytest.mark.asyncio
+async def test_non_streaming_tool_call_cut_off_is_incomplete():
+    request = ResponsesRequest(
+        input="weather in Paris?", tools=[WEATHER_TOOL], store=False
+    )
+    response = await _full(
+        request, CUT_OFF_CALLS["token-by-token"], PLAIN_PROMPT, finish_reason="length"
+    )
+
+    assert response.status == "incomplete"
+    (call,) = response.output
+    assert (call.type, call.status) == ("function_call", "incomplete")
 
 
 @needs_qwen38

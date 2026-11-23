@@ -104,7 +104,7 @@ from vllm.logprobs import Logprob as SampleLogprob
 from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
-from vllm.parser import ParserManager
+from vllm.parser import Parser, ParserManager
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -151,6 +151,27 @@ def _extract_allowed_tools_from_mcp_requests(
 
         allowed_tools_map[tool.server_label] = allowed_tools_val
     return allowed_tools_map
+
+
+def _last_call_cut_off(
+    parser: Parser | None, output: CompletionOutput | None, num_calls: int
+) -> bool:
+    """Whether the token limit ended the output inside its last tool call.
+
+    That call was opened but its end marker never came, and the parser still
+    returned it, with its arguments closed around a truncated value. Decided
+    from the markers of tool parsers that have them; with other parsers the
+    parsed calls are kept as they are.
+    """
+    if output is None or output.finish_reason != "length" or not num_calls:
+        return False
+    tool_parser = parser.tool_parser if parser is not None else None
+    start = getattr(tool_parser, "tool_call_start_token", None)
+    end = getattr(tool_parser, "tool_call_end_token", None)
+    if not (isinstance(start, str) and isinstance(end, str) and start and end):
+        return False
+    opened = output.text.count(start)
+    return opened == num_calls and opened > output.text.count(end)
 
 
 def _strip_leading_message_whitespace(
@@ -933,6 +954,34 @@ class OpenAIServingResponses(OpenAIServing):
                 output = self._make_response_output_items(
                     request, final_output, tokenizer, final_res.prompt_token_ids
                 )
+                calls = [
+                    i
+                    for i, item in enumerate(output)
+                    if isinstance(item, ResponseFunctionToolCall)
+                ]
+                if (
+                    calls
+                    and final_output.finish_reason == "length"
+                    and _last_call_cut_off(
+                        self.parser(
+                            tokenizer,
+                            request.tools,
+                            chat_template_kwargs=(
+                                self._effective_chat_template_kwargs(request)
+                            ),
+                        )
+                        if self.parser
+                        else None,
+                        final_output,
+                        len(calls),
+                    )
+                ):
+                    # The parser closed the arguments of the call the token
+                    # limit cut off around a truncated value.
+                    last = calls[-1]
+                    output[last] = output[last].model_copy(
+                        update={"status": "incomplete"}
+                    )
 
             if request.enable_response_messages:
                 input_messages = context.input_messages
@@ -1569,11 +1618,45 @@ class OpenAIServingResponses(OpenAIServing):
         assert isinstance(context, SimpleContext)
         full_parse = self._full_parse_output_items(request, context, tokenizer)
         expected_text = self._expected_open_item_text(processor, full_parse)
+        calls = [
+            item
+            for item in full_parse or []
+            if isinstance(item, ResponseFunctionToolCall)
+        ]
+        final_res = context.final_output
+        cut_off = _last_call_cut_off(
+            parser,
+            final_res.outputs[0] if final_res and final_res.outputs else None,
+            len(calls),
+        )
+        closed_calls = sum(
+            isinstance(item, ResponseFunctionToolCall)
+            for item in processor.output_items
+        )
+        if (
+            cut_off
+            and processor.state.current_state == _StateType.TOOL_CALL
+            and closed_calls == len(calls) - 1
+        ):
+            # The open call is the one the token limit cut off. The full
+            # parse would close its JSON around a truncated value, so it is
+            # closed as streamed and marked incomplete; a client must not run
+            # it.
+            processor.state.tool_call_cut_off = True
+            expected_text = None
         for event in processor.complete_current(expected_text):
             yield _increment_sequence_number_and_return(event)
         for event in processor.close_current():
             yield _increment_sequence_number_and_return(event)
         for item in self._unstreamed_items(processor, full_parse):
+            if cut_off and item is calls[-1]:
+                # Same as above, for a call the stream never opened.
+                logger.warning(
+                    "Not sending tool call %s at the end of the stream: "
+                    "the token limit cut it off.",
+                    item.name,
+                )
+                continue
             for event in processor.emit_item(item):
                 yield _increment_sequence_number_and_return(event)
         context.streamed_output_items = processor.output_items

@@ -839,6 +839,9 @@ class SimpleStreamingState:
     tool_call_id: str = ""
     tool_call_name: str = ""
     tool_call_index: int | None = None
+    # Set when the token limit cut the open tool call off: it is closed as
+    # streamed, with status "incomplete".
+    tool_call_cut_off: bool = False
     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
 
 
@@ -1118,7 +1121,7 @@ def emit_simple_tool_call_done(
                 type="function_call",
                 name=state.tool_call_name,
                 arguments=state.accumulated_text,
-                status="completed",
+                status="incomplete" if state.tool_call_cut_off else "completed",
                 id=state.current_item_id,
                 call_id=state.tool_call_id,
             ),
@@ -1126,6 +1129,7 @@ def emit_simple_tool_call_done(
     ]
     state.output_index += 1
     state.current_state = _StateType.NONE
+    state.tool_call_cut_off = False
     return events
 
 
